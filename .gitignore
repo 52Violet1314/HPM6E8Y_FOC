@@ -1,0 +1,31 @@
+# ---- 构建产物（仅本工程，SDK 目录不作过滤，保证可克隆即编译）----
+/build/
+/cmake-build-*/
+/Debug/
+/Release/
+/*.elf
+/*.bin
+/*.hex
+/*.map
+/*.lst
+/*.o
+/*.d
+/*.a
+
+# ---- IDE ----
+.idea/
+*.uvprojx
+*.uvoptx
+*.ewp
+*.eww
+*.dep
+.segger_project.json
+
+# ---- 编辑器/系统 ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- 本地化备份 ----
+/CMakeLists.txt.localized.bak

@@ -1,0 +1,39 @@
+{
+    // Cortex-Debug (marus25.cortex-debug) + SEGGER J-Link 调试 HPM6E8Y (RISC-V)
+    // 关键点：接口必须 JTAG（本板 SWD 连不上），GDB 必须用 riscv32-unknown-elf-gdb
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "J-Link Debug (HPM6E8Y)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "servertype": "jlink",
+            "serverpath": "C:/Program Files/SEGGER/JLink_V922/JLinkGDBServerCL.exe",
+            "interface": "JTAG",
+            "device": "HPM6E80xVMx",
+            "serverArgs": ["-speed", "1000"],
+            "executable": "${workspaceFolder}/build/output/demo.elf",
+            "gdbPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-gdb.exe",
+            "objdumpPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-objdump.exe",
+            "toolchainPrefix": "riscv32-unknown-elf",
+            "runToEntryPoint": "main",
+            "preLaunchTask": "build"
+        },
+        {
+            "name": "J-Link Attach (HPM6E8Y)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "cwd": "${workspaceFolder}",
+            "servertype": "jlink",
+            "serverpath": "C:/Program Files/SEGGER/JLink_V922/JLinkGDBServerCL.exe",
+            "interface": "JTAG",
+            "device": "HPM6E80xVMx",
+            "serverArgs": ["-speed", "1000"],
+            "executable": "${workspaceFolder}/build/output/demo.elf",
+            "gdbPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-gdb.exe",
+            "objdumpPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-objdump.exe",
+            "toolchainPrefix": "riscv32-unknown-elf"
+        }
+    ]
+}
