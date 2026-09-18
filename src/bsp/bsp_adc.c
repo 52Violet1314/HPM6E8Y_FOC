@@ -292,6 +292,14 @@ void bsp_adc_init(void)
 {
     s_cur_ready = false;    /* 还没采到数据 */
 
+    /* 先把电流/电压/温度采样引脚设为模拟功能。
+     * 注意: board_init() 没有调用本板 pinmux 的 init_adc_bldc_pins(),
+     * 漏掉会导致相电流采样通道悬空/读不到真实值。 */
+    init_adc_bldc_pins();
+    /* 母线电压 PF31 / 温度 PF08 也设为模拟输入 */
+    HPM_IOC->PAD[IOC_PAD_PF31].FUNC_CTL = IOC_PAD_FUNC_CTL_ANALOG_MASK;    /* VBUS: ADC3.07 */
+    HPM_IOC->PAD[IOC_PAD_PF08].FUNC_CTL = IOC_PAD_FUNC_CTL_ANALOG_MASK;    /* TEMP: ADC1.10 */
+
     (void)bsp_adc_init_current();
     (void)bsp_adc_init_oneshot(BSP_ADC_VBUS_BASE, BSP_ADC_VBUS_CH);
     (void)bsp_adc_init_oneshot(BSP_ADC_TEMP_BASE, BSP_ADC_TEMP_CH);
@@ -358,11 +366,14 @@ void bsp_adc_get_currents_ma(int32_t *iu, int32_t *iv, int32_t *iw)
     /* counts -> mA: counts * Vref_mV / FS / (Rshunt_ohm * gain) */
     const int32_t iu_cnt = (int32_t)s_cur_u_raw - (int32_t)s_cur_u_offset;   /* 减去零点偏移 */
     const int32_t iv_cnt = (int32_t)s_cur_v_raw - (int32_t)s_cur_v_offset;
-    /* shunt_ohm = mohm/1000, gain = GAIN_X10/10  => 分母 *10 */
+    /* shunt_ohm = mohm/1000, gain = GAIN_X10/10  => 分母 *10000
+     * 推导: I_mA = counts * Vref_mV / (FS * R_shunt_ohm * gain)
+     *            = counts * Vref_mV * 10000 / (FS * R_mohm * G_X10)
+     * 之前这里乘的是 10, 结果小了 1000 倍(电流一直显示接近 0, 限流形同虚设)。 */
     const int32_t denom = (int32_t)BSP_ADC_CURRENT_SHUNT_MOHM * (int32_t)BSP_ADC_CURRENT_GAIN_X10;
-    /* 用 int64 中间量防溢出: 码值 * 3300 * 10 可能超过 32bit */
-    int32_t u_ma = (denom != 0) ? (int32_t)(((int64_t)iu_cnt * BSP_ADC_REF_MV * 10) / ((int64_t)BSP_ADC_FULL_SCALE * denom)) : 0;
-    int32_t v_ma = (denom != 0) ? (int32_t)(((int64_t)iv_cnt * BSP_ADC_REF_MV * 10) / ((int64_t)BSP_ADC_FULL_SCALE * denom)) : 0;
+    /* 用 int64 中间量防溢出: 码值 * 3300 * 10000 会超过 32bit */
+    int32_t u_ma = (denom != 0) ? (int32_t)(((int64_t)iu_cnt * BSP_ADC_REF_MV * 10000) / ((int64_t)BSP_ADC_FULL_SCALE * denom)) : 0;
+    int32_t v_ma = (denom != 0) ? (int32_t)(((int64_t)iv_cnt * BSP_ADC_REF_MV * 10000) / ((int64_t)BSP_ADC_FULL_SCALE * denom)) : 0;
 
     if (iu) { *iu = u_ma; }
     if (iv) { *iv = v_ma; }

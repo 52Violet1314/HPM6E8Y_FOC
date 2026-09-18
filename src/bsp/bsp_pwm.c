@@ -117,6 +117,12 @@ void bsp_pwm_init(void)
     pwmv2_pair_config_t pwm_cfg = {0};      /* 一对互补通道的公共配置 */
     uint32_t i;
 
+    /* 0) 先把 PD00~PD05 复用到 PWM0 (UH/UL/VH/VL/WH/WL)。
+     *    注意: board_init() 里并没有调用本板 pinmux 的 init_pwm0_pins(),
+     *    如果这里不调用, PD0~PD5 就一直是默认功能, 栅极驱动的 6 路输入
+     *    永远收不到 PWM -> 电机无论如何都不会转。 */
+    init_pwm0_pins();
+
     /* 1) 打开电机 PWM 模块时钟(= STM32 的 RCC 使能 TIM1) */
     clock_add_to_group(BOARD_MOTOR_CLK_NAME, 0);
 
