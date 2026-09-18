@@ -51,21 +51,29 @@ sdk_inc(src/bsp)
 sdk_app_src(src/bsp/bsp_pwm.c)
 sdk_app_src(src/bsp/bsp_adc.c)
 sdk_app_src(src/bsp/bsp_usb.c)
+sdk_app_src(src/bsp/bsp_sei.c)
 sdk_app_src(src/bsp/usb_cdc_acm.c)
 
-# ---- Hardware: 传感器/驱动器驱动 ----
-# MT6701 磁编码器 (SSI 绝对角度, 经 SEI 读取)
+# ---- Hardware: 传感器/驱动器驱动 (纯协议层, 无硬件) ----
+# MT6701 磁编码器帧解析/CRC
 sdk_inc(src/Hardware/mt6701)
 sdk_app_src(src/Hardware/mt6701/mt6701.c)
-sdk_app_src(src/Hardware/mt6701/mt6701_sei.c)
 
 # ---- FOC: 磁场定向控制算法 ----
 sdk_inc(src/FOC)
 sdk_app_src(src/FOC/foc.c)
 sdk_app_src(src/FOC/foc_math.c)
 sdk_app_src(src/FOC/foc_openloop.c)
+sdk_app_src(src/FOC/foc_controller.c)
 # FOC 使用 sinf/cosf/sqrtf/fmodf, 需要链接 libm
 sdk_link_libraries(m)
+
+# ---- APP: 应用编排层 ----
+sdk_inc(src/app)
+sdk_app_src(src/app/app.c)
+sdk_app_src(src/app/app_diag.c)
+sdk_app_src(src/app/app_log.c)
+sdk_app_src(src/app/app_encoder.c)
 
 sdk_app_src(src/main.c)
 generate_ide_projects()

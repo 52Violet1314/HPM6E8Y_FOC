@@ -61,6 +61,9 @@ static volatile uint16_t s_cur_u_raw;
 static volatile uint16_t s_cur_v_raw;
 static volatile bool s_cur_ready;
 
+/* 应用层注册的电流采样完成回调 (中断上下文调用) */
+static bsp_adc_conv_cb_t s_conv_cb;
+
 static uint16_t s_cur_u_offset = BSP_ADC_FULL_SCALE / 2U;
 static uint16_t s_cur_v_offset = BSP_ADC_FULL_SCALE / 2U;
 
@@ -82,8 +85,8 @@ static uint16_t s_cur_v_offset = BSP_ADC_FULL_SCALE / 2U;
  * 【做了什么】
  *   1. 判断并清掉 ADC2 的 trig_complete 标志(= STM32 里清 ADC_FLAG_EOC);
  *   2. 从两个 DMA 缓冲区的固定槽位取出原始码值, 缓存到全局变量;
- *   3. 置 s_cur_ready 标志, 并回调 bsp_adc_conv_complete_cb(),
- *      用户可在回调里触发 FOC 电流环计算。
+ *   3. 置 s_cur_ready 标志, 并回调用户注册的回调(见 bsp_adc_register_conv_cb),
+ *      可在回调里触发 FOC 电流环计算。
  *
  * 对照 STM32: 等价于 ADC 转换完成中断里读 DR / 读 DMA 数组 + 调用
  *             HAL_ADC_ConvCpltCallback()。这里把 U/V 两路 ADC 放在同一
@@ -101,20 +104,19 @@ void bsp_adc_isr(void)
         s_cur_v_raw = (uint16_t)(s_adc_v_buff[BSP_ADC_SLOT] & 0xFFFFU);
         s_cur_ready = true;                                               /* 告诉主循环"有新数据" */
 
-        bsp_adc_conv_complete_cb();                                       /* 用户钩子: 可用来跑 FOC */
+        if (s_conv_cb != NULL) {
+            s_conv_cb();                                                  /* 用户注册的回调: 可用来跑 FOC */
+        }
     }
 }
 
 /**
- * @brief  电流采样完成回调 (弱定义)
- * @note   默认空实现。用户在自己的 .c 里定义同名函数即可覆盖(链接器优先选强符号),
- *         这是嵌入式里常见的"C 语言回调/虚函数"写法, 相当于 STM32 的
- *         __weak void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)。
- *
- *         典型用法: 在这里做 Clarke/Park 变换 + 电流 PI, 实现"电流环与 PWM 同步"。
+ * @brief  注册电流采样完成回调
+ * @param  cb  回调; NULL 表示注销
  */
-__attribute__((weak)) void bsp_adc_conv_complete_cb(void)
+void bsp_adc_register_conv_cb(bsp_adc_conv_cb_t cb)
 {
+    s_conv_cb = cb;
 }
 
 /**
@@ -309,8 +311,8 @@ void bsp_adc_init(void)
  * @brief  查询是否有新的相电流采样结果
  * @return true = 自上次查询以来至少完成过一次电流采样
  * @note   s_cur_ready 由中断置位, 主循环可据此决定是否更新控制量。
- *         更严谨的用法是在 bsp_adc_conv_complete_cb() 里直接做电流环,
- *         让"采样->计算->更新 PWM"严格发生在一个载波周期内。
+ *         更严谨的用法是注册一个采样完成回调(见 bsp_adc_register_conv_cb)
+ *         直接在中断里做电流环, 让"采样->计算->更新 PWM"严格发生在一个载波周期内。
  */
 bool bsp_adc_current_ready(void)
 {

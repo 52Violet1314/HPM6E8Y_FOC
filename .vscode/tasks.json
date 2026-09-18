@@ -14,6 +14,24 @@
                 "kind": "build",
                 "isDefault": true
             }
+        },
+        {
+            "label": "flash (OpenOCD + FT2232)",
+            "type": "shell",
+            "command": "D:/sdk_env/tools/openocd/openocd.exe",
+            "args": [
+                "-f", "${workspaceFolder}/openocd.cfg",
+                "-c", "program ${workspaceFolder}/build/output/demo.elf verify reset exit"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "dependsOn": ["build"],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            }
         }
     ]
 }

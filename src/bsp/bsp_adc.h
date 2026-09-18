@@ -70,12 +70,17 @@ int32_t bsp_adc_get_temperature_mc(void);
  */
 void bsp_adc_calibrate(void);
 
+/** @brief 电流采样完成回调类型 (在 ADC 中断上下文调用, 应尽量简短) */
+typedef void (*bsp_adc_conv_cb_t)(void);
+
 /**
- * @brief  电流采样完成回调 (弱定义, 用户可重写)
- * @note   在 ADC 中断上下文里被调用, 应尽量简短(例如只做 FOC 电流环计算)。
- *         对照 STM32: 类似 HAL_ADC_ConvCpltCallback()。
+ * @brief  注册电流采样完成回调
+ * @param  cb  回调; 传 NULL 表示注销
+ * @note   硬件中断 bsp_adc_isr 保留在本模块内; 应用层/FOC 通过此函数注册
+ *         回调, 采样完成后由中断调用。对照 STM32: 类似 HAL_ADC_ConvCpltCallback(),
+ *         但用运行时注册替代弱符号覆盖, 便于分层解耦。
  */
-void bsp_adc_conv_complete_cb(void);
+void bsp_adc_register_conv_cb(bsp_adc_conv_cb_t cb);
 
 #ifdef __cplusplus
 }

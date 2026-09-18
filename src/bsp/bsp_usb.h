@@ -36,14 +36,16 @@ bool bsp_usb_connected(void);
  */
 uint32_t bsp_usb_write(const uint8_t *data, uint32_t len);
 
+/** @brief 主机下发数据回调类型 (在 USB 中断上下文调用, 应保持简短) */
+typedef void (*bsp_usb_rx_cb_t)(const uint8_t *data, uint32_t len);
+
 /**
- * @brief  收到主机下发数据的回调 (弱定义, 用户可重写)
- * @param  data  收到的数据
- * @param  len   字节数
+ * @brief  注册主机下发数据回调
+ * @param  cb  回调; 传 NULL 表示注销
  * @note   在 USB 中断上下文被调用, 应保持简短。
- *         对照 STM32: 相当于 CDC_Receive_FS() 回调。
+ *         对照 STM32: 相当于 CDC_Receive_FS() 回调; 这里用运行时注册替代弱符号。
  */
-void bsp_usb_rx_callback(const uint8_t *data, uint32_t len);
+void bsp_usb_register_rx_cb(bsp_usb_rx_cb_t cb);
 
 #ifdef __cplusplus
 }

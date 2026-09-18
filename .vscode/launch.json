@@ -1,8 +1,50 @@
 {
-    // Cortex-Debug (marus25.cortex-debug) + SEGGER J-Link 调试 HPM6E8Y (RISC-V)
-    // 关键点：接口必须 JTAG（本板 SWD 连不上），GDB 必须用 riscv32-unknown-elf-gdb
+    // Cortex-Debug (marus25.cortex-debug) + OpenOCD 调试 HPM6E8Y (RISC-V)
+    // 关键点：
+    //   1. HPM6E8Y 是 RISC-V 核, GDB 必须用 riscv32-unknown-elf-gdb
+    //   2. FT2232 探针走 JTAG (本板 SWD 连不上)
+    //   3. servertype 用 "openocd", 由 OpenOCD 充当 GDB server
+    //   4. 也保留了 J-Link 配置, 按需切换
     "version": "0.2.0",
     "configurations": [
+        {
+            "name": "FT2232 OpenOCD Debug (HPM6E8Y)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "servertype": "openocd",
+            "serverpath": "D:/sdk_env/tools/openocd/openocd.exe",
+            "configFiles": [
+                "${workspaceFolder}/openocd.cfg"
+            ],
+            "interface": "jtag",
+            "searchDir": [],
+            "executable": "${workspaceFolder}/build/output/demo.elf",
+            "gdbPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-gdb.exe",
+            "objdumpPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-objdump.exe",
+            "toolchainPrefix": "riscv32-unknown-elf",
+            "runToEntryPoint": "main",
+            "preLaunchTask": "build",
+            "svdFile": ""
+        },
+        {
+            "name": "FT2232 OpenOCD Attach (HPM6E8Y)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "cwd": "${workspaceFolder}",
+            "servertype": "openocd",
+            "serverpath": "D:/sdk_env/tools/openocd/openocd.exe",
+            "configFiles": [
+                "${workspaceFolder}/openocd.cfg"
+            ],
+            "interface": "jtag",
+            "searchDir": [],
+            "executable": "${workspaceFolder}/build/output/demo.elf",
+            "gdbPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-gdb.exe",
+            "objdumpPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-objdump.exe",
+            "toolchainPrefix": "riscv32-unknown-elf",
+            "svdFile": ""
+        },
         {
             "name": "J-Link Debug (HPM6E8Y)",
             "type": "cortex-debug",

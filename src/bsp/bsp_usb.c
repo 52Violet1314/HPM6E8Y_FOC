@@ -31,6 +31,9 @@ extern void cdc_acm_init(uint8_t busid, uint32_t reg_base);              /* 初�
 extern void cdc_acm_send(uint8_t busid, const uint8_t *data, uint32_t len); /* 向主机发数据 */
 extern volatile bool dtr_enable;                                        /* 主机是否"打开了串口"(DTR=1) */
 
+/* 应用层注册的主机下发数据回调 (USB 中断上下文调用) */
+static bsp_usb_rx_cb_t s_rx_cb;
+
 /**
  * @brief  初始化 USB0 设备并枚举成 CDC ACM 虚拟串口
  * @note   三步:
@@ -75,15 +78,24 @@ uint32_t bsp_usb_write(const uint8_t *data, uint32_t len)
 }
 
 /**
- * @brief  主机下发数据的回调 (弱定义)
+ * @brief  注册主机下发数据回调
+ * @param  cb  回调; NULL 表示注销
+ * @note   在 USB 中断上下文被调用, 不要在这里做耗时操作。
+ */
+void bsp_usb_register_rx_cb(bsp_usb_rx_cb_t cb)
+{
+    s_rx_cb = cb;
+}
+
+/**
+ * @brief  主机下发数据的回调分发 (由 usb_cdc_acm.c 在 USB 中断上下文调用)
  * @param  data  收到的数据
  * @param  len   字节数
- * @note   默认空实现, 用户在应用层重定义以覆盖。在 USB 中断上下文被调用,
- *         不要在这里做耗时操作。
- *         对照 STM32: 相当于重写 CDC_Receive_FS()。
+ * @note   转发给应用层通过 bsp_usb_register_rx_cb() 注册的回调。
  */
-__attribute__((weak)) void bsp_usb_rx_callback(const uint8_t *data, uint32_t len)
+void bsp_usb_rx_callback(const uint8_t *data, uint32_t len)
 {
-    (void)data;
-    (void)len;
+    if (s_rx_cb != NULL) {
+        s_rx_cb(data, len);
+    }
 }
