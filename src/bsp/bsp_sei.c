@@ -49,6 +49,9 @@ static volatile bsp_sei_state_t s_bsp_sei;
 /* 应用层注册的"新帧到达"回调 (中断上下文调用) */
 static bsp_sei_frame_cb_t s_frame_cb;
 
+/* 初始化时的配置快照, 供 bsp_sei_get_diag() 读取 */
+static bsp_sei_diag_t s_sei_cfg;
+
 /* --------------------------------------------------------------------------
  * 回调注册
  * -------------------------------------------------------------------------- */
@@ -62,21 +65,13 @@ void bsp_sei_register_frame_cb(bsp_sei_frame_cb_t cb)
  * -------------------------------------------------------------------------- */
 void bsp_sei_init_pins(void)
 {
-#if (BSP_SEI_CTRL_INDEX == 0)
-    /* 本板 encoder 接口 (见 pinmux.c 顶部注释):
-     *   PC07 = SEI0_TX   PC06 = SEI0_RX   PC05 = SEI0_DE   PF04 = SEI0_CK
-     * SSI 实际只用 CK(时钟输出) 与 RX(数据输入), TX/DE 预留 RS485 模式。 */
-    HPM_IOC->PAD[IOC_PAD_PC07].FUNC_CTL = IOC_PC07_FUNC_CTL_SEI0_TX;
-    HPM_IOC->PAD[IOC_PAD_PC06].FUNC_CTL = IOC_PC06_FUNC_CTL_SEI0_RX;
-    HPM_IOC->PAD[IOC_PAD_PC05].FUNC_CTL = IOC_PC05_FUNC_CTL_SEI0_DE;
-    HPM_IOC->PAD[IOC_PAD_PF04].FUNC_CTL = IOC_PF04_FUNC_CTL_SEI0_CK;
-#else
-    /* SEI1 备选引脚 */
-    HPM_IOC->PAD[IOC_PAD_PE16].FUNC_CTL = IOC_PE16_FUNC_CTL_SEI1_TX;
-    HPM_IOC->PAD[IOC_PAD_PE17].FUNC_CTL = IOC_PE17_FUNC_CTL_SEI1_RX;
-    HPM_IOC->PAD[IOC_PAD_PE18].FUNC_CTL = IOC_PE18_FUNC_CTL_SEI1_DE;
-    HPM_IOC->PAD[IOC_PAD_PE19].FUNC_CTL = IOC_PE19_FUNC_CTL_SEI1_CK;
-#endif
+    /* 引脚复用定义在板级 (pinmux.c), 这里只调用板级接口, 不重复硬编码。
+     * 本板 (hpm6e00YZ) board.h: BOARD_SEI_CTRL = SEI_CTRL_1
+     *   -> init_sei_ctrl1_pins(): PE16=TX / PE17=RX / PE18=DE / PE19=CK
+     *   SSI 模式实际只用 CK(时钟输出) 与 RX(编码器数据输入), TX/DE 预留 RS485。
+     * 若换板后编码器改走 SEI_CTRL_0(PC 口), 把 BSP_SEI_CTRL_INDEX 改成 0,
+     * 并确认板级 pinmux 提供了对应引脚配置。 */
+    board_init_sei_pins(HPM_SEI, BSP_SEI_CTRL_INDEX);
 }
 
 /* --------------------------------------------------------------------------
@@ -95,6 +90,7 @@ void bsp_sei_init(void)
     uint8_t instr_idx;
     uint32_t clk_freq;
     uint32_t tick_per_us;
+    sei_idle_state_t idle_state;
 
     clock_add_to_group(BSP_SEI_CLK_NAME, 0);
     bsp_sei_init_pins();
@@ -104,24 +100,35 @@ void bsp_sei_init(void)
 
     clk_freq = clock_get_frequency(BSP_SEI_CLK_NAME);
 
+    /* 时钟/数据空闲电平 (见 bsp_sei.h 的 SSI 时序选项) */
+    idle_state = (BSP_SEI_CLK_IDLE_HIGH != 0) ? sei_idle_high_state : sei_idle_low_state;
+
     /* [1] 收发器: 同步主机 (SEI 产生 SSI 时钟) */
     transceiver_config.mode = sei_synchronous_master_mode;
     transceiver_config.tri_sample = false;
     transceiver_config.src_clk_freq = clk_freq;
     transceiver_config.synchronous_master_config.data_idle_high_z = false;
-    transceiver_config.synchronous_master_config.data_idle_state = sei_idle_high_state;
+    transceiver_config.synchronous_master_config.data_idle_state = idle_state;
     transceiver_config.synchronous_master_config.clock_idle_high_z = false;
-    transceiver_config.synchronous_master_config.clock_idle_state = sei_idle_high_state;
+    transceiver_config.synchronous_master_config.clock_idle_state = idle_state;
     transceiver_config.synchronous_master_config.baudrate = BSP_SEI_BAUDRATE;
     (void)sei_transceiver_config_init(BSP_SEI_BASE, BSP_SEI_CTRL, &transceiver_config);
 
-    /* SSI 时序: 时钟下降沿编码器换数据, 上升沿主机采样。
-     * rx_point = ck0_point, tx_point = ck1_point (与 SDK SSI 例程一致)。
-     * 若实测数据错位, 改为 rx=ck1_point / tx=ck0_point 试试。 */
+    /* SSI 采样/输出边沿 (由 BSP_SEI_SAMPLE_2ND_EDGE 选择, 见 bsp_sei.h):
+     *   第 1 边沿: rx=ck0, tx=ck1  -- 与 HPM SDK SSI 例程一致
+     *   第 2 边沿: rx=ck1, tx=ck0  -- 等价 SPI CPHA=1
+     * 若采样点选错, 数据会整体错位(常见: 角度恒为 0 或全 1)。 */
+#if (BSP_SEI_SAMPLE_2ND_EDGE != 0)
+    sei_set_xcvr_rx_point(BSP_SEI_BASE, BSP_SEI_CTRL,
+                          sei_get_xcvr_ck1_point(BSP_SEI_BASE, BSP_SEI_CTRL));
+    sei_set_xcvr_tx_point(BSP_SEI_BASE, BSP_SEI_CTRL,
+                          sei_get_xcvr_ck0_point(BSP_SEI_BASE, BSP_SEI_CTRL));
+#else
     sei_set_xcvr_rx_point(BSP_SEI_BASE, BSP_SEI_CTRL,
                           sei_get_xcvr_ck0_point(BSP_SEI_BASE, BSP_SEI_CTRL));
     sei_set_xcvr_tx_point(BSP_SEI_BASE, BSP_SEI_CTRL,
                           sei_get_xcvr_ck1_point(BSP_SEI_BASE, BSP_SEI_CTRL));
+#endif
 
     /* [2] 数据格式 */
 
@@ -262,12 +269,38 @@ void bsp_sei_init(void)
     trigger_input_config.trig_period_time = (uint32_t)BSP_SEI_PERIOD_US * tick_per_us;
     (void)sei_trigger_input_config_init(BSP_SEI_BASE, BSP_SEI_CTRL, &trigger_input_config);
 
+    /* 记录配置快照, 供应用层通过 bsp_sei_get_diag() 打印核对 */
+    s_sei_cfg.ctrl_index  = BSP_SEI_CTRL_INDEX;
+    s_sei_cfg.clk_freq    = clk_freq;
+    s_sei_cfg.baud_div    = sei_get_xcvr_baud_div(BSP_SEI_BASE, BSP_SEI_CTRL);
+    s_sei_cfg.ck0_point   = sei_get_xcvr_ck0_point(BSP_SEI_BASE, BSP_SEI_CTRL);
+    s_sei_cfg.ck1_point   = sei_get_xcvr_ck1_point(BSP_SEI_BASE, BSP_SEI_CTRL);
+    s_sei_cfg.trig_period = trigger_input_config.trig_period_time;
+
     /* 诊断: 如果 clk 打印为 0, 说明 SEI 时钟没拿到, 周期触发时间会变成 0,
      * 引擎就永远不会被触发(现象: CNT=0, E=0)。 */
     printf("[SEI] ctrl=%d clk=%u Hz, baud=%u, period=%u ticks\n",
            (int)BSP_SEI_CTRL_INDEX, (unsigned)clk_freq,
            (unsigned)BSP_SEI_BAUDRATE,
            (unsigned)trigger_input_config.trig_period_time);
+}
+
+/* --------------------------------------------------------------------------
+ * 诊断
+ * -------------------------------------------------------------------------- */
+void bsp_sei_get_diag(bsp_sei_diag_t *diag)
+{
+    if (diag == NULL) {
+        return;
+    }
+
+    *diag = s_sei_cfg;                     /* 配置快照 */
+
+    diag->frame_count = s_bsp_sei.frame_count;
+    diag->error_count = s_bsp_sei.error_count;
+    diag->irq_enable  = sei_get_irq_enable_status(BSP_SEI_BASE, BSP_SEI_CTRL);
+    diag->irq_flag    = sei_get_irq_flag(BSP_SEI_BASE, BSP_SEI_CTRL);
+    diag->peek_raw    = bsp_sei_peek_raw();
 }
 
 /* --------------------------------------------------------------------------
@@ -305,9 +338,10 @@ void bsp_sei_isr(void)
         s_bsp_sei.frame_count++;
         s_bsp_sei.new_frame = true;
 
-        /* 应用层注册的回调: 在中断上下文调用, 应尽量简短 */
+        /* 应用层注册的回调: 在中断上下文调用, 应尽量简短。
+         * 传局部副本 frame (非 volatile), 避免把 volatile 指针传给回调。 */
         if (cb != NULL) {
-            cb(&s_bsp_sei.frame, raw);
+            cb(&frame, raw);
         }
     }
 

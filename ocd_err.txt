@@ -1,0 +1,11 @@
+Open On-Chip Debugger 0.12.0+dev-00003-g02cebd827 (2026-05-25-03:00)
+Licensed under GNU GPL v2
+For bug reports, read
+	http://openocd.org/doc/doxygen/bugs.html
+Info : Listening on port 6666 for tcl connections
+Info : Listening on port 4444 for telnet connections
+Info : ftdi: if you experience problems at higher adapter clocks, try the command "ftdi tdo_sample_edge falling"
+Info : clock speed 10000 kHz
+Warn : Haven't made progress in mpsse_flush() for 2040ms.
+Warn : Haven't made progress in mpsse_flush() for 4080ms.
+Warn : Haven't made progress in mpsse_flush() for 8159ms.

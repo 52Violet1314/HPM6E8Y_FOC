@@ -5,7 +5,7 @@
  * APP: 编码器封装模块
  *
  *   把 MT6701 编码器的角度获取、方向修正、速度估算收敛到一个模块。
- *   应用层不再直接调 bsp_sei_get_latest() + mt6701_angle_to_rad() +
+ *   应用层不再直接调 bsp_mt6701_get_latest() + mt6701_angle_to_rad() +
  *   foc_speed_est_update() 这一串, 而只面对:
  *     encoder_get_mech_rad()  /  encoder_get_mech_rpm()  /  encoder_get_elec_rad()
  *

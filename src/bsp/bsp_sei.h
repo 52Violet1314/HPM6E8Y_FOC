@@ -15,10 +15,10 @@
  *   串行输出 24bit 数据。SEI 硬件按周期自动发起一帧, 收完后产生中断,
  *   中断里解析并缓存角度, 应用层随时读取最新值。
  *
- * 【本板引脚 (见 pinmux.c 顶部注释 / 原理图 encoder 页)】
- *   SEI0  PC07=TX  PC06=RX  PC05=DE  PF04=CK
+ * 【本板引脚 (见 pinmux.c / 原理图 encoder 页)】
+ *   SEI_CTRL_1  PE16=TX  PE17=RX  PE18=DE  PE19=CK
  *   实际只用到 CK(输出时钟) 和 RX(编码器数据输入)。
- *   若硬件实际走 SEI1(PE16~PE19), 把 BSP_SEI_CTRL_INDEX 改成 1。
+ *   注意: 本板 pinmux.c 只实现 CTRL_1 的引脚 (PE 口); CTRL_0(PC 口) 与 QEI0 复用。
  *
  * 【对照 STM32】
  *   SEI 相当于 STM32 的 SPI(主机) + 自动帧 + 位置采样单元,
@@ -38,14 +38,41 @@ extern "C" {
 
 /* ---- 硬件配置 (按需修改) ---- */
 
-/* SEI 控制块: 0 = SEI0(PC05/06/07 + PF04, 本板默认); 1 = SEI1(PE16~PE19) */
-#define BSP_SEI_CTRL_INDEX   (0)
+/* SEI 控制块, 必须与本板 board.h 的 BOARD_SEI_CTRL 一致。
+ *
+ *   1 = SEI_CTRL_1: PE16=TX / PE17=RX / PE18=DE / PE19=CK  <-- 本板使用
+ *   0 = SEI_CTRL_0: PC07=TX / PC06=RX / PC05=DE / PF04=CK  (与 QEI0 复用)
+ *
+ * 本板 pinmux.c 只实现了 CTRL_1 的引脚初始化 (init_sei_ctrl1_pins),
+ * 且 board.h 定义 BOARD_SEI_CTRL = SEI_CTRL_1 / BOARD_SEI_IRQn = IRQn_SEI0_1,
+ * 故此处用 1。若换板后编码器改走 SEI_CTRL_0(PC 口), 改回 0 即可。 */
+#define BSP_SEI_CTRL_INDEX   (1)
 
 /* SSI 时钟频率 (Hz)。MT6701 SSI 最高约 10MHz, 保守取 1MHz。 */
 #define BSP_SEI_BAUDRATE     (1000000U)
 
 /* 采样周期 (us)。200us = 5kHz, 满足常规 FOC 速度/位置环需求。 */
 #define BSP_SEI_PERIOD_US    (200U)
+
+/* ---- SSI 时序选项 (读不到数据时可在此切换) ----
+ *
+ * MT6701 有两种常见读法, 时钟极性相反:
+ *   A. SPI 模式 (本机 3 个 MT6701 参考工程 G474EtherCAT_FOC / iRDT / F405
+ *      均用 CPOL=0 + CPHA=1): 时钟【空闲低】, 第 2 边沿(下降沿)采样  <-- 默认
+ *   B. SSI 标准 / HPM SDK samples/drivers/sei/master/ssi 例程:
+ *      时钟【空闲高】, 第 1 边沿(下降沿)采样
+ *
+ * 默认按 A —— 与本机已验证能读 MT6701 的 3 个参考工程一致。
+ * 若 CNT 一直为 0, 或读回数据恒为 0 / 全 1, 改成 B 再试:
+ *      BSP_SEI_CLK_IDLE_HIGH   1
+ *      BSP_SEI_SAMPLE_2ND_EDGE 0
+ */
+
+/* 时钟空闲电平: 0 = 空闲低(SPI CPOL=0, MT6701 参考工程), 1 = 空闲高(SSI 标准) */
+#define BSP_SEI_CLK_IDLE_HIGH    (0)
+
+/* 采样边沿: 1 = 第 2 个时钟边沿(SPI CPHA=1), 0 = 第 1 个时钟边沿 */
+#define BSP_SEI_SAMPLE_2ND_EDGE  (1)
 
 /* 是否启用 CRC6 校验 (默认关闭, 用真实波形确认多项式后再开) */
 #define BSP_SEI_SSI_CRC_CHECK (0)
@@ -116,6 +143,35 @@ uint32_t bsp_sei_get_error_count(void);
 
 /** @brief 软件触发一次采样 (调试/单次读取用, 正常情况下周期触发已足够) */
 void bsp_sei_soft_trigger(void);
+
+/* ---- 诊断 ---- */
+
+/**
+ * @brief  SEI 诊断信息 (用于确认配置是否真的生效)
+ * @note   配置快照在 bsp_sei_init() 时记录; 计数/寄存器为读取时实时值。
+ */
+typedef struct {
+    /* --- 初始化时的配置快照 --- */
+    uint32_t ctrl_index;    /* SEI_CTRL_x                        */
+    uint32_t clk_freq;      /* 源时钟 Hz; 为 0 说明 SEI 时钟没拿到 */
+    uint32_t baud_div;      /* 波特率分频值 (实际写入寄存器)      */
+    uint32_t ck0_point;     /* 时钟第 1 边沿点                    */
+    uint32_t ck1_point;     /* 时钟第 2 边沿点                    */
+    uint32_t trig_period;   /* 周期触发时间 (源时钟 tick)         */
+
+    /* --- 读取时的实时状态 --- */
+    uint32_t frame_count;   /* 成功收帧数                         */
+    uint32_t error_count;   /* 传输/CRC 错误数                    */
+    uint32_t irq_enable;    /* 中断使能寄存器回读                 */
+    uint32_t irq_flag;      /* 当前中断标志回读                   */
+    uint32_t peek_raw;      /* 直接读硬件 DAT 寄存器拼出的 24bit   */
+} bsp_sei_diag_t;
+
+/**
+ * @brief  读取 SEI 诊断信息
+ * @param  diag  输出结构, 不可为 NULL
+ */
+void bsp_sei_get_diag(bsp_sei_diag_t *diag);
 
 #ifdef __cplusplus
 }

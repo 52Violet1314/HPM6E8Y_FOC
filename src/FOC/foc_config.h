@@ -18,7 +18,20 @@
 
 /* ---- 编码器安装 ---- */
 #define FOC_ENCODER_DIRECTION           (1.0f)      /* +1 或 -1, 编码器正方向与电机正方向关系 */
-#define FOC_ELEC_ANGLE_OFFSET           (0.0f)      /* 电角度偏置 (rad), 上电对齐后写入 */
+/* 电角度偏置 (rad)。
+ *
+ * 【怎么来的】用静态角度扫描标定 (app.h 的 APP_CAL_SWEEP_ENABLE):
+ *   把磁场按电角度分 12 步钉死, 每步等转子吸稳后读编码器角度, 由
+ *       offset = normalize(sw_elec - mech * POLE_PAIRS)
+ *   算出 12 个值: 2153 1870 1939 1833 1910 1934 2021 2116 2141 2228
+ *                 2254 2331  ->  均值 2061 mrad
+ *   散布 ±250 mrad 是齿槽转矩造成的静态平衡误差 (转子没完全对齐磁场)。
+ *
+ * 【为什么不能用旋转中的数据标定】旋转时负载角在整圈里摆动 (实测负载角
+ *   可摆 ±250°), DIFF 会扫遍全场, 任何一个采样值都不代表安装偏置。
+ *
+ * 【验证方法】改回标定模式重跑一次, CALSTEP 各行算出的 DIFF 应当接近 0。 */
+#define FOC_ELEC_ANGLE_OFFSET           (2.061f)
 
 /* ---- 控制频率 ---- */
 #define FOC_PWM_FREQ_HZ                 (20000U)    /* 载波频率, 与 bsp_pwm 一致 */

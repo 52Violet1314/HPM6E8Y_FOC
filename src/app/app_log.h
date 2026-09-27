@@ -26,17 +26,24 @@
 extern "C" {
 #endif
 
-/* ---- 日志级别 (数值越大越严重) ---- */
+/* ---- 日志级别 (数值越大越严重) ----
+ * 同时提供数字宏 (供 #if 预处理求值) 与枚举 (供运行时使用)。 */
+#define APP_LOG_LVL_DEBUG   (0)
+#define APP_LOG_LVL_INFO    (1)
+#define APP_LOG_LVL_WARN    (2)
+#define APP_LOG_LVL_ERROR   (3)
+
 typedef enum {
-    app_log_debug = 0,
-    app_log_info,
-    app_log_warn,
-    app_log_error,
+    app_log_debug = APP_LOG_LVL_DEBUG,
+    app_log_info  = APP_LOG_LVL_INFO,
+    app_log_warn  = APP_LOG_LVL_WARN,
+    app_log_error = APP_LOG_LVL_ERROR,
 } app_log_level_t;
 
-/* 编译期全局日志级别: 低于此级别的调用被裁剪掉 */
+/* 编译期全局日志级别: 用上面的数字宏, 低于此级别的 LOG_x 调用被完全裁剪掉。
+ * 例: -DAPP_LOG_LEVEL=APP_LOG_LVL_INFO 可静默所有 DEBUG 日志。 */
 #ifndef APP_LOG_LEVEL
-#define APP_LOG_LEVEL   app_log_debug
+#define APP_LOG_LEVEL   APP_LOG_LVL_DEBUG
 #endif
 
 /* ---- 后端 ---- */
@@ -71,25 +78,25 @@ void app_log_write_raw(const char *line);
 #endif
 
 /* ---- 便捷宏: LOG_[级别](模块TAG, 格式串, ...) ---- */
-#if APP_LOG_LEVEL <= 0
+#if APP_LOG_LEVEL <= APP_LOG_LVL_DEBUG
 #define LOG_D(tag, fmt, ...)  app_log_write(app_log_debug, tag, fmt, ##__VA_ARGS__)
 #else
 #define LOG_D(tag, fmt, ...)  ((void)0)
 #endif
 
-#if APP_LOG_LEVEL <= 1
+#if APP_LOG_LEVEL <= APP_LOG_LVL_INFO
 #define LOG_I(tag, fmt, ...)  app_log_write(app_log_info, tag, fmt, ##__VA_ARGS__)
 #else
 #define LOG_I(tag, fmt, ...)  ((void)0)
 #endif
 
-#if APP_LOG_LEVEL <= 2
+#if APP_LOG_LEVEL <= APP_LOG_LVL_WARN
 #define LOG_W(tag, fmt, ...)  app_log_write(app_log_warn, tag, fmt, ##__VA_ARGS__)
 #else
 #define LOG_W(tag, fmt, ...)  ((void)0)
 #endif
 
-#if APP_LOG_LEVEL <= 3
+#if APP_LOG_LEVEL <= APP_LOG_LVL_ERROR
 #define LOG_E(tag, fmt, ...)  app_log_write(app_log_error, tag, fmt, ##__VA_ARGS__)
 #else
 #define LOG_E(tag, fmt, ...)  ((void)0)

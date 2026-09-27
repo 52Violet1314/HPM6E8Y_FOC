@@ -173,6 +173,18 @@ void foc_openloop_update(foc_openloop_t *ol, float dt, float vbus,
         }
     }
 
+    /* ---- 保护 3: 不得超过 SVPWM 线性调制上限 VBUS/√3 ----
+     *
+     * foc_svpwm() 内部把占空比 clamp 到 [0,1], 一旦给定超过 VBUS/√3,
+     * 波形就被削顶: 幅值上不去, 却多出一堆谐波, 转矩反而更差。
+     *
+     * 这条也说明了一件事 —— 【低母线时给再高的电压给定都没用】。
+     * 母线 5V 时上限只有 5/√3 ≈ 2.89V; 想要更大转矩只能先抬母线,
+     * 或者改用电流环 (靠电流而不是电压出转矩)。 */
+    if (v_eff > (vbus * FOC_ONE_BY_SQRT3)) {
+        v_eff = vbus * FOC_ONE_BY_SQRT3;
+    }
+
     /* ---- 积分电角度 ---- */
     ol->elec_angle = foc_normalize_angle(ol->elec_angle + ol->elec_speed * dt);
 

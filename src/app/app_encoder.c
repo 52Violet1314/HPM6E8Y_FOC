@@ -9,7 +9,7 @@
 
 #include <string.h>
 
-#include "bsp_sei.h"
+#include "bsp_mt6701.h"
 
 void app_encoder_init(app_encoder_t *enc, float ts, float lpf_alpha)
 {
@@ -29,10 +29,10 @@ bool app_encoder_update(app_encoder_t *enc)
         return false;
     }
 
-    is_new = bsp_sei_get_latest(&enc->frame);
+    is_new = bsp_mt6701_get_latest(&enc->frame);
     enc->raw_angle = enc->frame.angle;
-    enc->frame_count = bsp_sei_get_frame_count();
-    enc->error_count = bsp_sei_get_error_count();
+    enc->frame_count = bsp_mt6701_get_frame_count();
+    enc->error_count = bsp_mt6701_get_error_count();
 
     /* 机械角度 = 原始角度 -> rad, 再乘方向系数 */
     enc->mech_rad = FOC_ENCODER_DIRECTION * mt6701_angle_to_rad(enc->raw_angle);

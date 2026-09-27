@@ -7,7 +7,7 @@
  *   - 帧格式: 14bit 角度 + 4bit 状态 + 6bit CRC = 24bit
  *   - 只做数据解析, 不依赖任何寄存器/外设, 便于单元测试和移植
  *
- * MT6701 SSI 数据帧 (MSB 先出, 时钟空闲为高, 上升沿采样):
+ * MT6701 SSI 数据帧 (MSB 先出):
  *   bit[23:10]  ANGLE  : 14bit 绝对角度, 0 ~ 16383 对应 0 ~ 360°
  *   bit[9:6]    STATUS : 4bit 状态
  *                          [1:0] 磁场状态 0=正常 1=过强 2=过弱 3=错误
@@ -16,7 +16,8 @@
  *   bit[5:0]    CRC6   : 6bit CRC, 多项式 x^6 + x + 1 (0x43), 初值 0
  *
  * 对照 STM32: 相当于一个纯软件的传感器协议解析文件,
- *             硬件接口部分见 mt6701_sei.c (SEI 硬件读取)。
+ *             硬件接口部分见 src/bsp/bsp_mt6701.c (SPI2 读取) /
+ *             src/bsp/bsp_sei.c (板载 SEI 通道读取)。
  */
 #ifndef MT6701_H
 #define MT6701_H
@@ -63,7 +64,7 @@ typedef struct {
  * @param  data18  前 18bit 数据 (角度 14bit << 4 | 状态 4bit)
  * @return 6bit CRC 值
  * @note   多项式 x^6 + x + 1 = 0b1000011 (0x43), 初值 0, MSB 先入。
- *         CRC 校验默认关闭 (见 mt6701_sei.c 的 MT6701_SSI_CRC_CHECK),
+ *         CRC 校验默认关闭 (见 src/bsp/bsp_mt6701.c 的 BSP_MT6701_CRC_CHECK),
  *         待用真实编码器波形确认多项式后再打开。
  */
 uint8_t mt6701_crc6(uint32_t data18);

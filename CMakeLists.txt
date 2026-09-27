@@ -51,8 +51,16 @@ sdk_inc(src/bsp)
 sdk_app_src(src/bsp/bsp_pwm.c)
 sdk_app_src(src/bsp/bsp_adc.c)
 sdk_app_src(src/bsp/bsp_usb.c)
-sdk_app_src(src/bsp/bsp_sei.c)
 sdk_app_src(src/bsp/usb_cdc_acm.c)
+# 编码器 = MT6701, 经 SPI2 走 J11 扩展排针 (PC26/PC28/PC24)
+sdk_app_src(src/bsp/bsp_spi.c)
+sdk_app_src(src/bsp/bsp_mt6701.c)
+# GPIO 软件模拟 SPI (bit-bang) —— 编码器接线排查, 自动扫描 16 种 CPOL/CPHA/CS/位序
+sdk_app_src(src/bsp/bsp_spi_bb.c)
+# 注: bsp_sei.c 是"板载 SEI 通道"的另一种编码器后端 (PE16~PE19),
+#     改用 J11 的 SPI 后暂不编入。要切回 SEI: 去掉下面这行注释,
+#     并把 app.c / app_encoder.c 里的 bsp_mt6701_* 换回 bsp_sei_*。
+#sdk_app_src(src/bsp/bsp_sei.c)
 
 # ---- Hardware: 传感器/驱动器驱动 (纯协议层, 无硬件) ----
 # MT6701 磁编码器帧解析/CRC

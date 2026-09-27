@@ -24,6 +24,13 @@ void foc_controller_init(foc_controller_t *ctrl, float ts)
 
     foc_init(&ctrl->foc);
     foc_openloop_init(&ctrl->openloop, ctrl->ts);
+
+    /* 【必须修正】foc_init() 里把 foc.ts 设成了 1/FOC_CURRENT_LOOP_FREQ_HZ
+     * (=50us, 按 20kHz 电流环假设), 但本工程实际是在 1kHz 主循环里调用
+     * foc_update() 的。PI 的积分项是 integral += ki * ts * error, ts 差 20 倍
+     * 就意味着积分速度差 20 倍 —— 环路会严重迟滞、几乎不起作用。
+     * 这里统一成真实的调用周期。 */
+    ctrl->foc.ts = ctrl->ts;
 }
 
 void foc_controller_set_mode(foc_controller_t *ctrl, foc_ctrl_mode_t mode)
@@ -42,6 +49,15 @@ void foc_controller_set_mode(foc_controller_t *ctrl, foc_ctrl_mode_t mode)
 foc_ctrl_mode_t foc_controller_get_mode(const foc_controller_t *ctrl)
 {
     return (ctrl != NULL) ? ctrl->mode : foc_ctrl_mode_openloop;
+}
+
+void foc_controller_set_dt(foc_controller_t *ctrl, float dt)
+{
+    if ((ctrl != NULL) && (dt > 0.0f)) {
+        ctrl->ts          = dt;     /* 开环/电流环都用它作为积分步长 */
+        ctrl->foc.ts      = dt;
+        ctrl->openloop.ts = dt;
+    }
 }
 
 void foc_controller_enable(foc_controller_t *ctrl, bool enable)
@@ -97,6 +113,14 @@ void foc_controller_set_align_angle(foc_controller_t *ctrl, float elec_rad)
         ctrl->openloop.elec_angle = elec_rad;
         foc_openloop_set_speed_elec(&ctrl->openloop, 0.0f);
     }
+}
+
+void foc_controller_set_external_angle(foc_controller_t *ctrl, float elec_rad)
+{
+    /* 与 set_align_angle 的内部动作相同(写死角度 + 停掉积分), 但语义不同:
+     * 这个函数是【每个控制周期都调】的, 用来把开环电压矢量的角度交给外部
+     * (编码器) 决定。命名分开是为了让调用点一眼看出"这是编码器换向"。 */
+    foc_controller_set_align_angle(ctrl, elec_rad);
 }
 
 /* ---- 电流环模式参数 ---- */
