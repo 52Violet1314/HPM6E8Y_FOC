@@ -194,7 +194,15 @@ void diag_lut_feed(uint32_t enc_raw, uint32_t sw_mrad);
  */
 void diag_lut_feed_static(uint32_t enc_raw, uint32_t sw_mrad);
 
-/** @return 已经有效的箱数 (>= ENC_LUT_MIN_CNT 个样本) */
+/**
+ * @brief  设置"多少样本算有效箱"的门限 (运行时, 默认 ENC_LUT_MIN_CNT)。
+ *         静态扫描每箱只有一个已吸稳+外推的样本, 用 3 会把 2/3 的箱判成
+ *         "从未学到"然后整体拒表 (实测 missed=664 maxhole=43 -> 被拒)。
+ *         静态路径在启动扫描前把它降到 1; 开环边转边学仍保持默认 3。
+ */
+void diag_lut_set_min_cnt(uint32_t n);
+
+/** @return 已经有效的箱数 (>= 当前 min_cnt 个样本) */
 uint32_t diag_lut_valid_bins(void);
 
 /**

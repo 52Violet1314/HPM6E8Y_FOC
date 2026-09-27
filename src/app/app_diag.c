@@ -249,6 +249,7 @@ static uint16_t s_lut_cnt[ENC_LUT_BINS];
 static int16_t  s_lut_lo[ENC_LUT_BINS];    /* 箱内偏差最小值 (相对 ref) */
 static int16_t  s_lut_hi[ENC_LUT_BINS];    /* 箱内偏差最大值 */
 static uint16_t s_lut_span[ENC_LUT_BINS];  /* 极差 = hi - lo, 判"这箱可不可信" */
+static uint32_t s_lut_min_cnt = ENC_LUT_MIN_CNT;  /* 运行时可调 (静态扫描降为 1) */
 
 /* "表项无效"必须用一个不可能和合法角度撞车的值。
  * 合法角度是 (-3141, 3141] mrad, 而负角度是合法的 —— 之前用 -1 同时表示
@@ -262,10 +263,15 @@ static int32_t lut_wrap_mrad(int32_t v)
     return v;
 }
 
+void diag_lut_set_min_cnt(uint32_t n)
+{
+    s_lut_min_cnt = n;
+}
+
 /* 取某箱的平均电角度; 样本不足返回 ENC_LUT_BIN_INVALID */
 static int32_t lut_bin_value(uint32_t b)
 {
-    if ((b >= ENC_LUT_BINS) || (s_lut_cnt[b] < ENC_LUT_MIN_CNT)) {
+    if ((b >= ENC_LUT_BINS) || (s_lut_cnt[b] < s_lut_min_cnt)) {
         return ENC_LUT_BIN_INVALID;
     }
     return lut_wrap_mrad((int32_t)s_lut_ref[b] +
@@ -415,7 +421,7 @@ uint32_t diag_lut_valid_bins(void)
     uint32_t n = 0U;
 
     for (i = 0U; i < ENC_LUT_BINS; i++) {
-        if (s_lut_cnt[i] >= ENC_LUT_MIN_CNT) {
+        if (s_lut_cnt[i] >= s_lut_min_cnt) {
             n++;
         }
     }
@@ -430,7 +436,7 @@ uint32_t diag_lut_max_hole(void)
 
     for (i = 0U; i < (2U * ENC_LUT_BINS); i++) {
         uint32_t b = i % ENC_LUT_BINS;
-        uint8_t  bad = ((s_lut_cnt[b] < ENC_LUT_MIN_CNT) ||
+        uint8_t  bad = ((s_lut_cnt[b] < s_lut_min_cnt) ||
                         ((int32_t)s_lut_span[b] > ENC_LUT_SPAN_MAX)) ? 1U : 0U;
 
         if (bad != 0U) {
@@ -506,7 +512,7 @@ uint32_t diag_lut_repair(void)
     uint32_t n_fix = 0U;
 
     for (i = 0U; i < ENC_LUT_BINS; i++) {
-        bad[i] = ((s_lut_cnt[i] < ENC_LUT_MIN_CNT) ||
+        bad[i] = ((s_lut_cnt[i] < s_lut_min_cnt) ||
                   ((int32_t)s_lut_span[i] > ENC_LUT_SPAN_MAX)) ? 1U : 0U;
     }
 
@@ -562,8 +568,8 @@ uint32_t diag_lut_repair(void)
         val = lut_wrap_mrad(val);
 
         s_lut_ref[i]  = 0;
-        s_lut_cnt[i]  = (uint16_t)ENC_LUT_MIN_CNT;
-        s_lut_acc[i]  = val * (int32_t)ENC_LUT_MIN_CNT;
+        s_lut_cnt[i]  = (uint16_t)s_lut_min_cnt;
+        s_lut_acc[i]  = val * (int32_t)s_lut_min_cnt;
         s_lut_span[i] = 0U;
         bad[i]        = 0U;         /* 修好的箱可以给后面的坏箱当参考 */
         n_fix++;
@@ -571,8 +577,8 @@ uint32_t diag_lut_repair(void)
 
     /* 回绕处 (0/1023) 也要能互相参考, 上面用取模已经覆盖 */
     for (i = 0U; i < ENC_LUT_BINS; i++) {
-        if (s_lut_cnt[i] < ENC_LUT_MIN_CNT) {
-            s_lut_cnt[i] = (uint16_t)ENC_LUT_MIN_CNT;   /* 兜底: 不留无效箱 */
+        if (s_lut_cnt[i] < s_lut_min_cnt) {
+            s_lut_cnt[i] = (uint16_t)s_lut_min_cnt;   /* 兜底: 不留无效箱 */
         }
     }
 

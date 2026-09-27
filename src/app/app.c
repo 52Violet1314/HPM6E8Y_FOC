@@ -288,7 +288,11 @@ void app_init(void)
      * 发热可以忽略。 */
     foc_controller_set_voltage(&s_ctrl, APP_OPENLOOP_VOLTAGE_V);
     foc_controller_set_align_angle(&s_ctrl, 0.0f);
-    LOG_I("ENC", "CAL SWEEP start: <=%u steps x %u loops, V=%d/%d mV (走到净行程满整圈为止)",
+    /* 静态每箱只有一个吸稳+外推样本, 有效门限用 3 会把整圈都扫完的表误拒
+     * (实测 missed=664 maxhole=43 -> REJECTED)。降到 1: 实测缺口最长 11 箱,
+     * 弦插值在本地线性的表上完全够用。 */
+    diag_lut_set_min_cnt(1U);
+    LOG_I("ENC", "CAL SWEEP start: <=%u steps x %u loops, V=%d/%d mV, mincnt=1 (走到净行程满整圈为止)",
           (unsigned)s_sweep_steps, (unsigned)APP_CAL_SWEEP_HOLD,
           (int)(APP_CAL_SWEEP_HIGH_V * 1000.0f),
           (int)(APP_CAL_SWEEP_LOW_V * 1000.0f));
