@@ -84,6 +84,9 @@ void bsp_bb_scan(void);
 /** @return 一个时钟都没打时 MISO 的静态电平 (0/1); 未扫描过时返回 0xFF */
 uint8_t bsp_bb_static_level(void);
 
+/** @return 【此刻】MISO 引脚电平 (0/1), 不打时钟、不改引脚配置 */
+uint8_t bsp_bb_miso_live(void);
+
 /** @return 读到"变化数据"(distinct>=2) 的组合数, 0..16 */
 uint32_t bsp_bb_hit_count(void);
 

@@ -585,6 +585,31 @@ uint32_t diag_lut_repair(void)
     return n_fix;
 }
 
+void diag_lut_snapshot(int16_t *vals_mrad)
+{
+    uint32_t b;
+
+    for (b = 0U; b < ENC_LUT_BINS; b++) {
+        int32_t v = lut_bin_value(b);
+
+        vals_mrad[b] = (v == ENC_LUT_BIN_INVALID) ? (int16_t)0 : (int16_t)v;
+    }
+}
+
+void diag_lut_load(const int16_t *vals_mrad)
+{
+    uint32_t b;
+
+    for (b = 0U; b < ENC_LUT_BINS; b++) {
+        int32_t v = (int32_t)vals_mrad[b];
+
+        s_lut_ref[b]  = 0;
+        s_lut_cnt[b]  = (uint16_t)s_lut_min_cnt;
+        s_lut_acc[b]  = v * (int32_t)s_lut_min_cnt;
+        s_lut_span[b] = 0U;
+    }
+}
+
 static uint32_t s_spd_min[ENC_SPDMAP_SECT];
 static uint32_t s_spd_cnt[ENC_SPDMAP_SECT];
 static uint8_t  s_spd_done;

@@ -59,6 +59,12 @@ float app_encoder_get_mech_rpm(const app_encoder_t *enc);
 /** @return 电角度 (rad, 含极对数与安装偏置) */
 float app_encoder_get_elec_rad(const app_encoder_t *enc);
 
+/** @brief 运行时覆盖安装偏置 (校准存档载入后调用) */
+void  app_encoder_set_elec_offset_rad(float offset_rad);
+
+/** @return 当前安装偏置 (rad) */
+float app_encoder_get_elec_offset_rad(void);
+
 /** @return 原始角度 (14bit) */
 uint16_t app_encoder_get_raw_angle(const app_encoder_t *enc);
 

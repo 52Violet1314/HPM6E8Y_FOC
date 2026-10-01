@@ -224,6 +224,12 @@ uint32_t diag_lut_repair(void);
  */
 uint32_t diag_lut_max_hole(void);
 
+/** @brief 把当前整张表拷出来 (mrad), 存档用。须在修表之后调用。 */
+void diag_lut_snapshot(int16_t *vals_mrad);
+
+/** @brief 用存档覆盖整张表 (mrad), 每箱标记为有效。上电直接查表换向用。 */
+void diag_lut_load(const int16_t *vals_mrad);
+
 /**
  * @brief  表自洽性体检 (不修表)。
  *         沿 raw 走一圈, 每一步取【最接近 ENC_LUT_STEP_NOMINAL 的回绕分支】

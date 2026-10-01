@@ -270,6 +270,14 @@ uint8_t bsp_bb_static_level(void)
     return s_static_level;
 }
 
+/* 现场读一次 MISO 电平 (不打时钟, 不动引脚复用)。
+ * 用途: 编码器没响应时, 边看日志边拨线, 电平能立刻反映接线/供电状态。
+ * 空闲应为 1 (被上拉拉高); 恒 0 = 被硬拉低 (没供电/线断/芯片坏)。 */
+uint8_t bsp_bb_miso_live(void)
+{
+    return bb_miso_read();
+}
+
 uint32_t bsp_bb_hit_count(void)
 {
     return s_hit_count;

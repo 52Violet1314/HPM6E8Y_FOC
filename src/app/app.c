@@ -18,6 +18,7 @@
 #include "app_diag.h"
 #include "app_log.h"
 #include "app_encoder.h"
+#include "app_nv.h"
 
 #include "bsp_pwm.h"
 #include "bsp_adc.h"
@@ -60,6 +61,7 @@ static uint32_t s_sweep_ref;        /* 本次保持的 raw 解卷绕参考 */
 static int32_t  s_sweep_a1;         /* 前半段(正常电压)增量累加 */
 static int32_t  s_sweep_a2;         /* 后半段(弱场)增量累加 */
 static uint8_t  s_sweep_done;
+static int32_t  s_cal_offset_mrad = (int32_t)(FOC_ELEC_ANGLE_OFFSET * 1000.0f); /* 存档用标定偏移 */
 static uint32_t s_sweep_steps;      /* = PHASES × 极对数 × REVS, app_init 里算 */
 static uint32_t s_cyc_ref;          /* 上一个电周期边界的 raw, 用来算本周期推进量 */
 /* 残差汇总 (用于自动给出推荐偏置) */
@@ -255,6 +257,30 @@ void app_init(void)
     foc_controller_init(&s_ctrl, dt);
     foc_controller_set_voltage(&s_ctrl, APP_OPENLOOP_VOLTAGE_V);
     foc_controller_set_current_limit(&s_ctrl, APP_OPENLOOP_CURRENT_LIMIT);
+
+    /* ---- 非易失校准数据 (Flash) ----
+     * 有合法存档就直接查表换向, 跳过 3 分钟静态扫描。
+     * 【不调 app_nv_init()】上电时 CPU 正在这片 NOR 上取指, 任何 XPI 重配置
+     * 都会把启动流程卡死 (症状: BUILD 行之后无输出)。读档是纯 XIP 直读,
+     * 不需要配置; 只有"写存档"时才在 RAM 里懒加载配置。 */
+    {
+        static int16_t nv_tbl[ENC_LUT_BINS];
+        int32_t        nv_off = 0;
+
+        if (app_nv_load(nv_tbl, &nv_off)) {
+            diag_lut_load(nv_tbl);
+            app_encoder_set_elec_offset_rad((float)nv_off * 0.001f);
+            s_lut_full   = 1U;
+            s_sweep_done = 1U;
+            foc_controller_set_voltage(&s_ctrl, APP_ENC_LUT_RUN_VOLTAGE_V);
+            foc_controller_set_current_limit(&s_ctrl, APP_ENC_LUT_RUN_CURRENT_LIMIT_A);
+            LOG_I("ENC", "NV: loaded LUT + offset from flash (offset=%ld mrad) -> LUT commutation, skip cal",
+                  (long)nv_off);
+        } else {
+            LOG_I("ENC", "NV: no valid table in flash -> run calibration");
+        }
+    }
+
     s_ctrl.openloop.elec_accel = APP_OPENLOOP_ACCEL;
 #if APP_FOC_CLOSED_LOOP_ENABLE
     /* ---- 闭环: 用编码器角度换向 ----
@@ -270,13 +296,19 @@ void app_init(void)
           (int)APP_FOC_RPM_LIMIT);
 #else
 #  if APP_CAL_SWEEP_ENABLE
+    if (s_lut_full == 0U) {
     /* 静态扫描标定: 磁场从 0° 开始分步固定, 由 app_run 推进 */
     /* 这里算的是【步数上限】: 正常会在"净行程走满一整圈"时提前收尾 (见 app_run
      * 里的里程计)。给 1.5 倍余量, 极对数比配置值大 (实测配 12 时 12 个电周期
      * 只走了 0.95 圈) 或中途丢过步也能扫完整圈。 */
+    /* 【步数上限从 ×1.5 提到 ×2.5】(3600 -> 6000 步)
+     * 真正收尾靠下面的净行程里程计 (odo 满 16384 = 走满整圈), 这里只是兜底上限。
+     * 原来只给 1.5 倍余量: 弱场下转子打滑时 (实测每电周期只走 1026/640 counts,
+     * 理想 1365), 3600 步只覆盖约 91% 的圈 -> 缺口 > 16 箱 -> 直接被否掉。
+     * 给到 2.5 倍后即使按 3 counts/步 的严重打滑也能走完 (6000×3 = 18000 > 16384),
+     * 而正常跟得住时里程计会在 ~2400 步就收尾, 时间不变。 */
     s_sweep_steps = APP_CAL_SWEEP_PHASES
-                    * ((uint32_t)FOC_MOTOR_POLE_PAIRS +
-                       ((uint32_t)FOC_MOTOR_POLE_PAIRS / 2U))
+                    * ((uint32_t)FOC_MOTOR_POLE_PAIRS * 5U / 2U)
                     * APP_CAL_SWEEP_REVS;
     if (s_sweep_steps < APP_CAL_SWEEP_PHASES) {
         s_sweep_steps = APP_CAL_SWEEP_PHASES;
@@ -296,6 +328,7 @@ void app_init(void)
           (unsigned)s_sweep_steps, (unsigned)APP_CAL_SWEEP_HOLD,
           (int)(APP_CAL_SWEEP_HIGH_V * 1000.0f),
           (int)(APP_CAL_SWEEP_LOW_V * 1000.0f));
+    }
 #  elif APP_OPENLOOP_ALIGN_ONLY
     foc_controller_set_align_angle(&s_ctrl, APP_OPENLOOP_ALIGN_DEG * (FOC_TWO_PI / 360.0f));
 #  elif APP_ENC_ANGLE_DRIVE
@@ -356,6 +389,55 @@ void app_run(void)
                  bsp_mt6701_get_last_raw(),
                  bsp_mt6701_get_transfer_fail());
     (void)app_encoder_update(&s_encoder);
+
+    /* ---- 【编码器/校准体检】每 1s 一行, 串口直接看 ----
+     * 编码器没接/没供电/线断/被烤坏时, 不接调试器也能一眼判定:
+     *   frames 恒 0 + errs 每拍都涨 + miso=0  ->  编码器根本没有响应,
+     *   此时固件看到的"转子不动"是真的读不到角度, 不是电机的问题。 */
+    {
+        static uint32_t enc_log_tick = 0U;
+        static uint32_t enc_no_frame  = 0U;
+
+        enc_log_tick += APP_MAIN_LOOP_MS;
+        if (enc_log_tick >= 1000U) {
+            uint32_t fr = bsp_mt6701_get_frame_count();
+            uint32_t er = bsp_mt6701_get_error_count();
+            uint32_t tf = bsp_mt6701_get_transfer_fail();
+            uint8_t  mi = bsp_bb_miso_live();
+
+            enc_log_tick = 0U;
+
+            LOG_I("ENC",
+                  "health: reader=%s bb=%d miso=%u scan(hit=%u crc=%u best=%d static=%u) "
+                  "frames=%u errs=%u tfail=%u raw=%u last=0x%06x | sweep=%u/%u odo=%ld stall=%u lutfull=%u reject=%u",
+                  bsp_bb_is_active() ? "bitbang" : "spi2",
+                  (int)bsp_bb_best_index(),
+                  (unsigned)mi,
+                  (unsigned)bsp_bb_hit_count(),
+                  (unsigned)bsp_bb_crc_hit_count(),
+                  (int)bsp_bb_best_index(),
+                  (unsigned)bsp_bb_static_level(),
+                  (unsigned)fr, (unsigned)er, (unsigned)tf,
+                  (unsigned)bsp_mt6701_get_raw_angle(),
+                  (unsigned)bsp_mt6701_get_last_raw(),
+                  (unsigned)s_sweep_step, (unsigned)s_sweep_steps,
+                  (long)s_sweep_odo, (unsigned)s_sweep_stall,
+                  (unsigned)s_lut_full, (unsigned)s_lut_reject);
+
+            if (fr == 0U) {
+                enc_no_frame++;
+                if (enc_no_frame >= 5U) {
+                    enc_no_frame = 0U;
+                    LOG_I("ENC",
+                          "!! 编码器一帧都没收到: MISO 空闲=%u (正常应为 1)。"
+                          "查 J11: PC26=SCLK / PC28=MISO / PC24=CS, 以及编码器 3.3V/GND",
+                          (unsigned)mi);
+                }
+            } else {
+                enc_no_frame = 0U;
+            }
+        }
+    }
 
     diag_set_stage(APP_STAGE_LOOP_VBUS);
     vbus = (float)bsp_adc_get_vbus_mv() * 0.001f;
@@ -486,6 +568,19 @@ void app_run(void)
                                                APP_ENC_LUT_RUN_VOLTAGE_V);
                     foc_controller_set_current_limit(&s_ctrl,
                                                      APP_ENC_LUT_RUN_CURRENT_LIMIT_A);
+
+                    /* 【存档】表已被接受, 立即写 Flash, 以后上电免校准 */
+                    {
+                        static int16_t nv_tbl[ENC_LUT_BINS];
+
+                        diag_lut_snapshot(nv_tbl);
+                        if (app_nv_save(nv_tbl, s_cal_offset_mrad)) {
+                            LOG_I("ENC", "NV: LUT + offset saved to flash (offset=%ld mrad)",
+                                  (long)s_cal_offset_mrad);
+                        } else {
+                            LOG_I("ENC", "NV: save FAILED");
+                        }
+                    }
 
                     LOG_I("ENC",
                           "LUT %u/%u full -> LUT commutation ON, lead=%d deg, V=%d mV Ilim=%d mA",
@@ -671,7 +766,7 @@ void app_run(void)
     {
         float sw_rad   = foc_normalize_angle(s_ctrl.openloop.elec_angle);
         float mech_rad = app_encoder_get_mech_rad(&s_encoder);
-        float enc_elec = foc_mech_to_elec(mech_rad, FOC_ELEC_ANGLE_OFFSET);
+        float enc_elec = foc_mech_to_elec(mech_rad, app_encoder_get_elec_offset_rad());
         float diff_rad = sw_rad - enc_elec;
 
         while (diff_rad > (FOC_TWO_PI * 0.5f)) {
@@ -849,11 +944,12 @@ void app_run(void)
                  * 若推荐值与当前值几乎相同 -> 校准已被验证通过。 */
                 int32_t mean_res = s_sweep_res_ref +
                                    s_sweep_res_acc / (int32_t)s_sweep_res_n;
-                int32_t rec = (int32_t)(FOC_ELEC_ANGLE_OFFSET * 1000.0f) + mean_res;
+                int32_t rec = (int32_t)(app_encoder_get_elec_offset_rad() * 1000.0f) + mean_res;
 
                 while (rec < 0)     { rec += 6283; }
                 while (rec >= 6283) { rec -= 6283; }
 
+                s_cal_offset_mrad = rec;   /* 存档用 */
                 s_sweep_done = 1U;
 
                 /* 【扫完自动恢复旋转, 不再关断输出】

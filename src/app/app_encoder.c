@@ -11,6 +11,8 @@
 
 #include "bsp_mt6701.h"
 
+static float s_elec_offset_rad = FOC_ELEC_ANGLE_OFFSET;
+
 void app_encoder_init(app_encoder_t *enc, float ts, float lpf_alpha)
 {
     if (enc == NULL) {
@@ -41,8 +43,8 @@ bool app_encoder_update(app_encoder_t *enc)
     float speed_rad_s = foc_speed_est_update(&enc->speed_est, enc->mech_rad);
     enc->mech_rpm = speed_rad_s * (60.0f / FOC_TWO_PI);
 
-    /* 电角度 = 机械角度 * 极对数 + 安装偏置 */
-    enc->elec_rad = foc_mech_to_elec(enc->mech_rad, FOC_ELEC_ANGLE_OFFSET);
+    /* 电角度 = 机械角度 * 极对数 + 安装偏置 (偏置可被校准存档覆盖) */
+    enc->elec_rad = foc_mech_to_elec(enc->mech_rad, s_elec_offset_rad);
 
     return is_new;
 }
@@ -60,6 +62,16 @@ float app_encoder_get_mech_rpm(const app_encoder_t *enc)
 float app_encoder_get_elec_rad(const app_encoder_t *enc)
 {
     return (enc != NULL) ? enc->elec_rad : 0.0f;
+}
+
+void app_encoder_set_elec_offset_rad(float offset_rad)
+{
+    s_elec_offset_rad = offset_rad;
+}
+
+float app_encoder_get_elec_offset_rad(void)
+{
+    return s_elec_offset_rad;
 }
 
 uint16_t app_encoder_get_raw_angle(const app_encoder_t *enc)

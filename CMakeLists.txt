@@ -82,6 +82,7 @@ sdk_app_src(src/app/app.c)
 sdk_app_src(src/app/app_diag.c)
 sdk_app_src(src/app/app_log.c)
 sdk_app_src(src/app/app_encoder.c)
+sdk_app_src(src/app/app_nv.c)
 
 sdk_app_src(src/main.c)
 generate_ide_projects()
