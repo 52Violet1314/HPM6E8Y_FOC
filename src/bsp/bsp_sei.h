@@ -48,8 +48,8 @@ extern "C" {
  * 故此处用 1。若换板后编码器改走 SEI_CTRL_0(PC 口), 改回 0 即可。 */
 #define BSP_SEI_CTRL_INDEX   (1)
 
-/* SSI 时钟频率 (Hz)。MT6701 SSI 最高约 10MHz, 保守取 1MHz。 */
-#define BSP_SEI_BAUDRATE     (1000000U)
+/* 与已验证的 SPI2 配置保持一致：250kHz，先用慢速确认时序和电平。 */
+#define BSP_SEI_BAUDRATE     (250000U)
 
 /* 采样周期 (us)。200us = 5kHz, 满足常规 FOC 速度/位置环需求。 */
 #define BSP_SEI_PERIOD_US    (200U)
@@ -62,17 +62,15 @@ extern "C" {
  *   B. SSI 标准 / HPM SDK samples/drivers/sei/master/ssi 例程:
  *      时钟【空闲高】, 第 1 边沿(下降沿)采样
  *
- * 默认按 A —— 与本机已验证能读 MT6701 的 3 个参考工程一致。
- * 若 CNT 一直为 0, 或读回数据恒为 0 / 全 1, 改成 B 再试:
- *      BSP_SEI_CLK_IDLE_HIGH   1
- *      BSP_SEI_SAMPLE_2ND_EDGE 0
+ * 当前按 SPI2 实测成功的 Mode 0：CPOL=0、CPHA=0，即空闲低、第一边沿采样。
+ * 若后续逻辑分析仪确认你的 MT6701 接成标准 SSI 空闲高，再切换到 B。
  */
 
 /* 时钟空闲电平: 0 = 空闲低(SPI CPOL=0, MT6701 参考工程), 1 = 空闲高(SSI 标准) */
 #define BSP_SEI_CLK_IDLE_HIGH    (0)
 
 /* 采样边沿: 1 = 第 2 个时钟边沿(SPI CPHA=1), 0 = 第 1 个时钟边沿 */
-#define BSP_SEI_SAMPLE_2ND_EDGE  (1)
+#define BSP_SEI_SAMPLE_2ND_EDGE  (0)
 
 /* 是否启用 CRC6 校验 (默认关闭, 用真实波形确认多项式后再开) */
 #define BSP_SEI_SSI_CRC_CHECK (0)

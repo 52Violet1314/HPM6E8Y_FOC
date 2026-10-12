@@ -16,6 +16,10 @@ set(CONFIG_USB_DEVICE 1)
 set(CONFIG_USB_DEVICE_CDC_ACM 1)
 # HPM 数学库 (软件子集): FOC 使用其查表快速 sin/cos
 set(CONFIG_HPM_MATH 1)
+# LVGL 9.x GUI middleware.  The board-specific display/input port remains
+# application-owned until the panel controller and pinout are selected.
+set(CONFIG_LVGL 1)
+set(CONFIG_LVGL_CUSTOM_PORTABLE 1)
 
 # ---- 构建类型 (HPM_BUILD_TYPE) ----
 #   ram       : 链接到 ILM/RAM (入口 0x0)。SDK 默认值。
@@ -52,15 +56,19 @@ sdk_app_src(src/bsp/bsp_pwm.c)
 sdk_app_src(src/bsp/bsp_adc.c)
 sdk_app_src(src/bsp/bsp_usb.c)
 sdk_app_src(src/bsp/usb_cdc_acm.c)
-# 编码器 = MT6701, 经 SPI2 走 J11 扩展排针 (PC26/PC28/PC24)
+# 编码器 = MT6701, 经 SPI2 走 J11 扩展排针。
 sdk_app_src(src/bsp/bsp_spi.c)
 sdk_app_src(src/bsp/bsp_mt6701.c)
-# GPIO 软件模拟 SPI (bit-bang) —— 编码器接线排查, 自动扫描 16 种 CPOL/CPHA/CS/位序
+# GPIO 软件模拟 SPI 作为接线排查/兜底后端
 sdk_app_src(src/bsp/bsp_spi_bb.c)
-# 注: bsp_sei.c 是"板载 SEI 通道"的另一种编码器后端 (PE16~PE19),
-#     改用 J11 的 SPI 后暂不编入。要切回 SEI: 去掉下面这行注释,
-#     并把 app.c / app_encoder.c 里的 bsp_mt6701_* 换回 bsp_sei_*。
-#sdk_app_src(src/bsp/bsp_sei.c)
+
+# ---- LCD/LVGL: migrated from the fullfuncgui board example ----
+sdk_inc(src/lcd)
+sdk_app_src(src/lcd/LCDHw.c)
+sdk_app_src(src/lcd/LCDTouch.c)
+sdk_app_src(src/lcd/LCDGui.c)
+sdk_app_src(src/lcd/lcd_app.c)
+sdk_app_src(src/lcd/lcd_ui.c)
 
 # ---- Hardware: 传感器/驱动器驱动 (纯协议层, 无硬件) ----
 # MT6701 磁编码器帧解析/CRC

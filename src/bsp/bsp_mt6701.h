@@ -26,6 +26,9 @@
 
 #include "mt6701.h"
 
+/* 当前恢复使用已经验证过的 J11 SPI2 后端。 */
+#define BSP_MT6701_USE_SEI (0)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -78,6 +81,15 @@ uint32_t bsp_mt6701_get_raw(void);
 
 /** @return 最近一帧原始角度 (14bit) */
 uint16_t bsp_mt6701_get_raw_angle(void);
+
+/** @return 最近一帧 MT6701 的 4bit 状态字段 */
+uint8_t bsp_mt6701_get_status(void);
+
+/** @return 最近一帧 CRC 是否通过 */
+bool bsp_mt6701_get_crc_ok(void);
+
+/** @return 最近一帧是否报告跟踪丢失 */
+bool bsp_mt6701_get_track_loss(void);
 
 /** @return 编码器角度 (弧度) */
 float bsp_mt6701_get_angle_rad(void);

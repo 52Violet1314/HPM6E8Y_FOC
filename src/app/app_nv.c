@@ -35,7 +35,8 @@
 #define APP_NV_FLASH_ADDR    (BOARD_FLASH_BASE_ADDRESS + 0x003F0000UL)
 #define APP_NV_SECTOR_BYTES  (4096U)
 #define APP_NV_MAGIC         (0x3154554CUL)   /* "LTU1" */
-#define APP_NV_VERSION       (1UL)
+/* 换电机后作废旧电机的 LUT/偏置存档。 */
+#define APP_NV_VERSION       (2UL)
 #define APP_NV_HEADER_BYTES  (28U)
 #define APP_NV_TABLE_OFFSET  (APP_NV_HEADER_BYTES)
 

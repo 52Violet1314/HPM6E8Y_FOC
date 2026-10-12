@@ -24,8 +24,12 @@
 #include "bsp_adc.h"
 #include "bsp_usb.h"
 #include "bsp_mt6701.h"
+#if BSP_MT6701_USE_SEI
+#include "bsp_sei.h"
+#else
 #include "bsp_spi.h"
 #include "bsp_spi_bb.h"
+#endif
 
 #include "foc_controller.h"
 
@@ -192,12 +196,22 @@ void app_init(void)
     bsp_usb_init();
     diag_set_stage(APP_STAGE_USB_INIT);
 
-    /* MT6701 (编码器) 初始化: SPI2 @ J11 扩展排针
-     *   PC26=SCLK(脚31) / PC28=MISO(脚10) / PC24=CS(脚11)
-     * 走普通 SPI 主机, 没有硬件周期触发, 由主循环主动 poll。 */
+    /* MT6701 编码器初始化 */
     bsp_mt6701_register_frame_cb(app_on_mt6701_frame);
     bsp_mt6701_init();
     diag_set_stage(APP_STAGE_SEI_INIT);
+#if BSP_MT6701_USE_SEI
+    {
+        bsp_sei_diag_t sd;
+        bsp_sei_get_diag(&sd);
+        LOG_I("ENC", "MT6701 SEI SSI Master: SEI_CTRL_%u CK=PE19 RX=PE17",
+              (unsigned)sd.ctrl_index);
+        LOG_I("SEI", "clk=%uHz baud_div=%u ck0=%u ck1=%u period=%u irq_en=0x%08x",
+              (unsigned)sd.clk_freq, (unsigned)sd.baud_div,
+              (unsigned)sd.ck0_point, (unsigned)sd.ck1_point,
+              (unsigned)sd.trig_period, (unsigned)sd.irq_enable);
+    }
+#else
     LOG_I("ENC", "MT6701 SPI2 @ J11: SCLK=PC26(pin31) MISO=PC28(pin10) CS=PC24(pin11)");
     /* 时钟/分频诊断: 确认源时钟、实际 SCLK、以及时序初始化是否成功
      * (timing=0 表示 status_success) */
@@ -205,7 +219,9 @@ void app_init(void)
           (unsigned)bsp_spi_get_src_clk(),
           (unsigned)bsp_spi_get_sclk(),
           bsp_spi_get_timing_stat());
+#endif
 
+#if !BSP_MT6701_USE_SEI
     /* ---- 编码器接线 bit-bang 排查 ----
      * 用 GPIO 软件模拟 SPI, 把 16 种 CPOL/CPHA/CS方式/位序 组合全试一遍。
      * 目的: 把"SPI2 外设"和"模式配对"这两个变量一起排除掉。
@@ -252,6 +268,7 @@ void app_init(void)
           (unsigned)ENC_LUT_MIN_CNT, (unsigned)APP_ENC_STUCK_KICK_MS);
     {
     }
+#endif
 
     /* 统一 FOC 控制器: 默认开环模式 */
     foc_controller_init(&s_ctrl, dt);
@@ -402,17 +419,38 @@ void app_run(void)
         if (enc_log_tick >= 1000U) {
             uint32_t fr = bsp_mt6701_get_frame_count();
             uint32_t er = bsp_mt6701_get_error_count();
+#if !BSP_MT6701_USE_SEI
             uint32_t tf = bsp_mt6701_get_transfer_fail();
             uint8_t  mi = bsp_bb_miso_live();
+#endif
 
             enc_log_tick = 0U;
 
+#if BSP_MT6701_USE_SEI
+            {
+                bsp_sei_diag_t sd;
+                bsp_sei_get_diag(&sd);
+                LOG_I("ENC",
+                      "health: reader=sei ctrl=%u frames=%u errs=%u angle=%u status=0x%x crc=%u track=%u raw=0x%06x peek=0x%06x irq_en=0x%08x irq_flag=0x%08x "
+                      "sweep=%u/%u odo=%ld stall=%u lutfull=%u reject=%u",
+                      (unsigned)sd.ctrl_index, (unsigned)fr, (unsigned)er,
+                      (unsigned)bsp_mt6701_get_raw_angle(),
+                      (unsigned)bsp_mt6701_get_status(),
+                      (unsigned)bsp_mt6701_get_crc_ok(),
+                      (unsigned)bsp_mt6701_get_track_loss(),
+                      (unsigned)bsp_mt6701_get_raw(),
+                      (unsigned)sd.peek_raw, (unsigned)sd.irq_enable,
+                      (unsigned)sd.irq_flag,
+                      (unsigned)s_sweep_step, (unsigned)s_sweep_steps,
+                      (long)s_sweep_odo, (unsigned)s_sweep_stall,
+                      (unsigned)s_lut_full, (unsigned)s_lut_reject);
+            }
+#else
             LOG_I("ENC",
                   "health: reader=%s bb=%d miso=%u scan(hit=%u crc=%u best=%d static=%u) "
                   "frames=%u errs=%u tfail=%u raw=%u last=0x%06x | sweep=%u/%u odo=%ld stall=%u lutfull=%u reject=%u",
                   bsp_bb_is_active() ? "bitbang" : "spi2",
-                  (int)bsp_bb_best_index(),
-                  (unsigned)mi,
+                  (int)bsp_bb_best_index(), (unsigned)mi,
                   (unsigned)bsp_bb_hit_count(),
                   (unsigned)bsp_bb_crc_hit_count(),
                   (int)bsp_bb_best_index(),
@@ -423,15 +461,21 @@ void app_run(void)
                   (unsigned)s_sweep_step, (unsigned)s_sweep_steps,
                   (long)s_sweep_odo, (unsigned)s_sweep_stall,
                   (unsigned)s_lut_full, (unsigned)s_lut_reject);
+#endif
 
             if (fr == 0U) {
                 enc_no_frame++;
                 if (enc_no_frame >= 5U) {
                     enc_no_frame = 0U;
+#if BSP_MT6701_USE_SEI
+                    LOG_I("ENC",
+                          "!! SEI 一帧都没收到: 检查 SEI1 CK=PE19、RX=PE17、编码器 3.3V/GND、SSI 时序和 CSN/Z");
+#else
                     LOG_I("ENC",
                           "!! 编码器一帧都没收到: MISO 空闲=%u (正常应为 1)。"
                           "查 J11: PC26=SCLK / PC28=MISO / PC24=CS, 以及编码器 3.3V/GND",
                           (unsigned)mi);
+#endif
                 }
             } else {
                 enc_no_frame = 0U;

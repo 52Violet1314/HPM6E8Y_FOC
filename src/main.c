@@ -19,6 +19,7 @@
 #include "hpm_csr_drv.h"
 
 #include "app.h"
+#include "lcd_app.h"
 
 int main(void)
 {
@@ -28,6 +29,10 @@ int main(void)
 
     /* 应用初始化: 外设 + FOC + 回调注册 */
     app_init();
+
+    /* LCD/LVGL: ILI9341 + XPT2046 board example port */
+    lcd_app_hardware_init();
+    lcd_app_ui_init();
 
     /* 主循环: 用 mcycle 做【精确】周期节拍。
      *
@@ -44,10 +49,19 @@ int main(void)
             period_cycles = 1U;
         }
 
+        uint32_t gui_divider = 0U;
+
         while (1) {
             uint64_t t0 = hpm_csr_get_core_mcycle();
 
             app_run();
+
+            /* Keep GUI work out of the 1 kHz FOC critical path as much as
+             * possible while still servicing LVGL at roughly 200 Hz. */
+            if (++gui_divider >= 5U) {
+                gui_divider = 0U;
+                lcd_app_task_handler();
+            }
 
             /* 补足到本周期结束 (app_run 超时就不补, 自然降速) */
             while ((hpm_csr_get_core_mcycle() - t0) < (uint64_t)period_cycles) {

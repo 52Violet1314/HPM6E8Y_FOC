@@ -13,7 +13,11 @@
 
 #include <string.h>
 
+#if BSP_MT6701_USE_SEI
+#include "bsp_sei.h"
+#else
 #include "bsp_spi.h"
+#endif
 
 /* ---- 模块状态 ---- */
 static bsp_mt6701_state_t   s_mt6701;
@@ -26,12 +30,35 @@ void bsp_mt6701_init(void)
      * 就注册了回调 (与 bsp_sei 的约定一致); 若 init 顺手清掉, 成功帧就
      * 没人处理, 现象是 CNT/ERR 恒为 0 (之前就栽在这里)。 */
 
+#if BSP_MT6701_USE_SEI
+    bsp_sei_init();
+#else
     /* SPI2 + J11 引脚 (PC26=SCLK / PC28=MISO / PC24=CS) */
     bsp_spi_init();
+#endif
 }
 
 bool bsp_mt6701_poll(void)
 {
+#if BSP_MT6701_USE_SEI
+    mt6701_frame_t frame;
+
+    /* SEI 已由周期触发器自动收帧；这里把最新帧搬到兼容缓存，
+     * 让原有 app_encoder 层继续使用 bsp_mt6701_* API。 */
+    if (!bsp_sei_get_latest(&frame)) {
+        return false;
+    }
+
+    s_mt6701.frame = frame;
+    s_mt6701.raw = bsp_sei_get_raw();
+    s_mt6701.last_raw = s_mt6701.raw;
+    s_mt6701.new_frame = true;
+
+    if (s_frame_cb != NULL) {
+        s_frame_cb(&frame, s_mt6701.raw);
+    }
+    return true;
+#else
     uint8_t  rx[BSP_MT6701_FRAME_BYTES];
     mt6701_frame_t frame;
     uint32_t raw;
@@ -77,6 +104,7 @@ bool bsp_mt6701_poll(void)
     }
 
     return true;
+#endif
 }
 
 void bsp_mt6701_register_frame_cb(bsp_mt6701_frame_cb_t cb)
@@ -106,6 +134,21 @@ uint16_t bsp_mt6701_get_raw_angle(void)
     return s_mt6701.frame.angle;
 }
 
+uint8_t bsp_mt6701_get_status(void)
+{
+    return s_mt6701.frame.status;
+}
+
+bool bsp_mt6701_get_crc_ok(void)
+{
+    return s_mt6701.frame.crc_ok;
+}
+
+bool bsp_mt6701_get_track_loss(void)
+{
+    return s_mt6701.frame.track_loss;
+}
+
 float bsp_mt6701_get_angle_rad(void)
 {
     return mt6701_angle_to_rad(s_mt6701.frame.angle);
@@ -113,20 +156,37 @@ float bsp_mt6701_get_angle_rad(void)
 
 uint32_t bsp_mt6701_get_frame_count(void)
 {
+#if BSP_MT6701_USE_SEI
+    return bsp_sei_get_frame_count();
+#else
     return s_mt6701.frame_count;
+#endif
 }
 
 uint32_t bsp_mt6701_get_error_count(void)
 {
+#if BSP_MT6701_USE_SEI
+    return bsp_sei_get_error_count();
+#else
     return s_mt6701.error_count;
+#endif
 }
 
 uint32_t bsp_mt6701_get_last_raw(void)
 {
+#if BSP_MT6701_USE_SEI
+    /* SEI 无 SPI transfer；peek_raw 用于尚未收帧时的硬件诊断。 */
+    return bsp_sei_peek_raw();
+#else
     return s_mt6701.last_raw;
+#endif
 }
 
 uint32_t bsp_mt6701_get_transfer_fail(void)
 {
+#if BSP_MT6701_USE_SEI
+    return 0U;
+#else
     return s_mt6701.transfer_fail;
+#endif
 }

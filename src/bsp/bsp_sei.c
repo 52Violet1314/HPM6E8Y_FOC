@@ -72,6 +72,16 @@ void bsp_sei_init_pins(void)
      * 若换板后编码器改走 SEI_CTRL_0(PC 口), 把 BSP_SEI_CTRL_INDEX 改成 0,
      * 并确认板级 pinmux 提供了对应引脚配置。 */
     board_init_sei_pins(HPM_SEI, BSP_SEI_CTRL_INDEX);
+
+    /* 与 SPI2 的 MISO 配置一致：MT6701 DO/SSI 数据线按开漏/三态处理时，
+     * 必须有上拉才能在空闲和数据释放期间得到稳定高电平。 */
+    HPM_IOC->PAD[IOC_PAD_PE17].PAD_CTL = IOC_PAD_PAD_CTL_SR_SET(1) |
+                                          IOC_PAD_PAD_CTL_SPD_SET(3) |
+                                          IOC_PAD_PAD_CTL_PRS_SET(2) |
+                                          IOC_PAD_PAD_CTL_PE_SET(1) |
+                                          IOC_PAD_PAD_CTL_PS_SET(1);
+    HPM_IOC->PAD[IOC_PAD_PE19].PAD_CTL = IOC_PAD_PAD_CTL_SR_SET(1) |
+                                          IOC_PAD_PAD_CTL_SPD_SET(3);
 }
 
 /* --------------------------------------------------------------------------
@@ -154,13 +164,21 @@ void bsp_sei_init(void)
     (void)sei_cmd_data_format_config_init(BSP_SEI_BASE, SEI_SELECT_DATA,
                                           BSP_SEI_DAT_STAT, &data_format_config);
 
-    /* [3] 指令序列 */
+    /* [3] 指令序列。
+     * SPI2 实测为 Mode 0（空闲低，先上升后下降），SEI 必须使用
+     * RISE_FALL；若使用 FALL_RISE，空闲低时首个边沿相位相反，可能整帧
+     * 都不会完成。 */
+#if (BSP_SEI_CLK_IDLE_HIGH != 0)
+#define BSP_SEI_RECV_CLK_MODE SEI_INSTR_M_CK_FALL_RISE
+#else
+#define BSP_SEI_RECV_CLK_MODE SEI_INSTR_M_CK_RISE_FALL
+#endif
     instr_idx = 0;
     /* 收 14bit 角度 */
-    sei_set_instr(BSP_SEI_BASE, instr_idx++, SEI_INSTR_OP_RECV, SEI_INSTR_M_CK_FALL_RISE,
+    sei_set_instr(BSP_SEI_BASE, instr_idx++, SEI_INSTR_OP_RECV, BSP_SEI_RECV_CLK_MODE,
                   SEI_DAT_0, BSP_SEI_DAT_ANGLE, 14);
     /* 收 10bit 状态 + CRC */
-    sei_set_instr(BSP_SEI_BASE, instr_idx++, SEI_INSTR_OP_RECV, SEI_INSTR_M_CK_FALL_RISE,
+    sei_set_instr(BSP_SEI_BASE, instr_idx++, SEI_INSTR_OP_RECV, BSP_SEI_RECV_CLK_MODE,
                   SEI_DAT_0, BSP_SEI_DAT_STAT, 10);
     /* 超时指令: 时钟保持高, 数据用常量 0 */
     sei_set_instr(BSP_SEI_BASE, instr_idx++, SEI_INSTR_OP_RECV, SEI_INSTR_M_CK_HIGH,
@@ -324,6 +342,14 @@ void bsp_sei_isr(void)
         angle = sei_get_data_value(BSP_SEI_BASE, BSP_SEI_DAT_ANGLE) & MT6701_ANGLE_MAX;
         stat  = sei_get_data_value(BSP_SEI_BASE, BSP_SEI_DAT_STAT) & BSP_SEI_STAT_MASK;
         raw   = (angle << 10) | stat;    /* 还原 24bit: 角度[23:10] + 状态/CRC[9:0] */
+
+        /* 与 SPI 后端保持一致：全 0/全 1 说明 RX 没有收到编码器有效数据，
+         * 常见原因是 CSN 未拉低、MODE 未选 SSI、DO 断线或 RX 被上拉锁死。
+         * 不能把 0xffffff 当成 angle=16383 喂给换向和 LUT。 */
+        if ((raw == 0x000000U) || (raw == MT6701_SSI_FRAME_MASK)) {
+            s_bsp_sei.error_count++;
+            return;
+        }
 
         mt6701_decode_frame(raw, &frame);
 

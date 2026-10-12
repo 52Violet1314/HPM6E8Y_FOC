@@ -9,11 +9,11 @@
 #define FOC_CONFIG_H
 
 /* ---- 电机参数 ---- */
-#define FOC_MOTOR_POLE_PAIRS            (12.0f)     /* 极对数 (已按实测电机改为 12) */
+#define FOC_MOTOR_POLE_PAIRS            (11.0f)     /* 4015 中空电机极对数 */
 /* 相电阻/相电感未知: 先用开环驱动 (foc_openloop) 调试, 不依赖这两个值;
  * 等实际测量(万用表测线电阻/电感表)后再填入, 用于电流环 PI 整定。 */
-#define FOC_MOTOR_RS_OHM                (0.0f)      /* 相电阻 (Ω), 未知填 0 */
-#define FOC_MOTOR_LS_HENRY              (0.0f)      /* 相电感 (H), 未知填 0 */
+#define FOC_MOTOR_RS_OHM                (5.4f)      /* 相电阻 (Ω); 若 5.4Ω 是线间值，需改为 2.7Ω */
+#define FOC_MOTOR_LS_HENRY              (0.0013f)   /* 相电感 (H); 若 1.3mH 是线间值，需改为 0.65mH */
 #define FOC_MOTOR_FLUX_WB               (0.0f)      /* 磁链 (Wb), 未知填 0 */
 
 /* ---- 编码器安装 ---- */
