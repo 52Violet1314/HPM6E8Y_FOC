@@ -28,6 +28,7 @@
 #include "bsp_pwm.h"
 #include "bsp_adc.h"
 #include "bsp_usb.h"
+#include "bsp_button.h"     /* J11 按键 (位置点动) */
 #include "bsp_mt6701.h"
 #if BSP_MT6701_USE_SEI
 #include "bsp_sei.h"
@@ -1105,10 +1106,16 @@ void app_init(void)
         }
     }
 #endif
-#if APP_FOC_CLOSED_LOOP_ENABLE
+#if APP_MOTION_ENABLE
     LOG_I("FOC", "speed loop: dir=%d, target=%d RPM (位置环每拍会重写它)",
           (int)s_speed_dir, (int)s_speed_target_rpm);
 #endif
+
+    /* ================= 第五步: 按键 (J11 排针) =================
+     * 只做引脚复用/上拉和消抖状态初始化, 采样与事件处理在 app_run 里
+     * (控制任务, 1kHz)。脚位与接线见 src/bsp/bsp_button.h。 */
+    bsp_button_init();
+    LOG_I("BTN", "按键就绪: PD8(J11-42)=位置+  PC25(J11-27)=位置-  PD16(J11-12)=回起点");
 #if APP_FOC_CLOSED_LOOP_ENABLE
     LOG_I("APP", "motor ENABLED: CURRENT LOOP, iq_ref=%d mA, id_ref=%d mA, Kp=0.%02d V/A, Ki=%d V/(A*s), OC=%d mA",
           (int)(APP_FOC_IQ_REF_A * 1000.0f), (int)(APP_FOC_ID_REF_A * 1000.0f),
@@ -1303,6 +1310,16 @@ uint8_t app_motion_took_over(void)
 #endif
 }
 
+void app_motion_set_enable(uint8_t enable)
+{
+#if APP_MOTION_ENABLE
+    app_motion_enable(&s_motion, (enable != 0U) ? true : false,
+                      app_encoder_get_mech_rad(&s_encoder));
+#else
+    (void)enable;
+#endif
+}
+
 float app_motion_get_speed_ref(void)
 {
 #if APP_MOTION_ENABLE
@@ -1414,6 +1431,63 @@ void app_run(void)
         /* 标记"本拍位置环接管了速度给定"。app_speed_apply() 会把状态拍成快照,
          * 显示层据此显示位置环状态而不是把速度条的值当成用户设定。 */
         s_motion_takeover = 1U;
+    }
+
+    /* ---- 按键位置点动 (J11 排针: PD8=+, PC25=-, PD16=回起点) ----
+     * 【为什么在控制任务里读按键】消抖和长按连发都需要稳定的采样周期, 控制任务
+     * 正好是 1kHz; 而且按键最终要改位置目标, 这个目标只允许控制任务改。
+     * 【每拍只走一步】按下/连发一次只把目标挪 APP_BTN_STEP_RAD (5°),
+     * 并把目标限幅在"当前位置 ±APP_BTN_TARGET_WINDOW_RAD"之内 —— 防止连按堆出
+     * 一个很大的位置误差, 一松手就满速冲过去撞限位。 */
+    {
+        uint32_t ev = bsp_button_poll_all();
+        uint8_t  e_up   = (uint8_t)((ev >> ((uint32_t)BSP_BTN_UP   * 4U)) & 0xFU);
+        uint8_t  e_down = (uint8_t)((ev >> ((uint32_t)BSP_BTN_DOWN * 4U)) & 0xFU);
+        uint8_t  e_home = (uint8_t)((ev >> ((uint32_t)BSP_BTN_HOME * 4U)) & 0xFU);
+
+        if (e_up != BSP_BTN_EV_NONE) {
+            float tgt = app_motion_get_target_rad() + APP_BTN_STEP_RAD;
+            float pos = app_motion_get_pos_rad();
+
+            if (tgt > (pos + APP_BTN_TARGET_WINDOW_RAD)) {
+                tgt = pos + APP_BTN_TARGET_WINDOW_RAD;
+            }
+            app_motion_set_target_rad(tgt);
+        } else if (e_down != BSP_BTN_EV_NONE) {
+            float tgt = app_motion_get_target_rad() - APP_BTN_STEP_RAD;
+            float pos = app_motion_get_pos_rad();
+
+            if (tgt < (pos - APP_BTN_TARGET_WINDOW_RAD)) {
+                tgt = pos - APP_BTN_TARGET_WINDOW_RAD;
+            }
+            app_motion_set_target_rad(tgt);
+        } else if (e_home != BSP_BTN_EV_NONE) {
+            /* 回起点 = 把"当前位置"重新定为零点并停在这里。
+             * 比分两步做: ①关掉位置环(速度给定归零) ②把展开基准清掉并重新使能 ——
+             * 重新使能时 app_motion_enable() 会把当前角度设为目标, 于是电机原地
+             * 停住而目标/反馈都归零, 不会"先冲回去再停"。 */
+            app_motion_set_enable(0U);
+            app_motion_set_target_rad(0.0f);
+            s_motion.turns_rad    = 0.0f;
+            s_motion.unwrap_valid = false;
+            app_motion_set_enable(1U);
+            LOG_I("MOT", "按键: 已把当前位置重新定为零点");
+        }
+
+        /* 接线排查: 上电后每 5 秒报一次三个按键的原始电平。
+         * 松开时应全为 0 (低有效), 若恒为 1 -> 引脚被拉低: 按键接错/短路/脚选错。 */
+        {
+            static uint32_t btn_log_tick;
+
+            btn_log_tick += APP_MAIN_LOOP_MS;
+            if (btn_log_tick >= 5000U) {
+                btn_log_tick = 0U;
+                LOG_I("BTN", "按键电平(PRO): up=%u down=%u home=%u (松开应全为 0)",
+                      (unsigned)bsp_button_raw_level(BSP_BTN_UP),
+                      (unsigned)bsp_button_raw_level(BSP_BTN_DOWN),
+                      (unsigned)bsp_button_raw_level(BSP_BTN_HOME));
+            }
+        }
     }
 #endif
 

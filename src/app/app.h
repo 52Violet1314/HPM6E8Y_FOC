@@ -725,6 +725,27 @@ float app_motion_get_err_rad(void);
  */
 void app_motion_set_target_rad(float pos_rad);
 
+/**
+ * @brief  使能/关闭位置环
+ * @note   使能瞬间会把"当前位置"设为目标(原地保持), 所以不会一使能就冲;
+ *         关闭时速度给定归零, 电机在速度环作用下停转。
+ */
+void app_motion_set_enable(uint8_t enable);
+
+/* ================= 按键位置点动 (J11 排针) =================
+ *
+ * 每按一次动一步, 长按连发。按键接线与脚位见 src/bsp/bsp_button.h。
+ *   按键1 (PD8,  J11-42): 位置 +
+ *   按键2 (PC25, J11-27): 位置 -
+ *   按键3 (PD16, J11-12): 回起点 (把当前位置重新定为 0 并停在那里)
+ */
+#define APP_BTN_STEP_RAD        (0.0872665f)    /* 每步 5° */
+/* 【为什么目标要限幅在当前位置附近】位置环是"位置误差 -> 速度给定"的 P 控制,
+ * 误差越大速度给定越大 (最终被 APP_MOTION_SPEED_LIMIT_RPM 夹住)。如果连按把
+ * 一个很大的误差堆进去, 一松手就是满速冲过去, 很容易撞机械限位。所以把目标限制
+ * 在"当前位置 ±这个角度"之内: 单次按键只走一小步, 但绝不允许累积成大阶跃。 */
+#define APP_BTN_TARGET_WINDOW_RAD (0.5235988f)  /* ±30° */
+
 #ifdef __cplusplus
 }
 #endif

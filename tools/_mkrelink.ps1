@@ -13,7 +13,8 @@ $objs = @(($line -split '\s+') | Where-Object { $_ -like '*.obj' })
 # 但 obj 已经被 _cc.py 编出来了 —— 这里按"src/ 下每个 .c 都应该有 obj"补进链接列表,
 # 否则症状是 undefined reference (明明编过了却链不上)。
 $extra = @(
-    'CMakeFiles/app.dir/src/app/app_motion.c.obj'
+    'CMakeFiles/app.dir/src/app/app_motion.c.obj',
+    'CMakeFiles/app.dir/src/bsp/bsp_button.c.obj'
 )
 foreach ($e in $extra) {
     $p = Join-Path $B $e
