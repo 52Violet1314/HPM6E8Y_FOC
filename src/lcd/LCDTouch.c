@@ -27,6 +27,54 @@
 #define TC_GPIO_SPIMISO	IOC_PAD_PC22
 #define TC_GPIO_SPIMOSI	IOC_PAD_PC23
 
+/* ======================================================================
+ *  编译期引脚冲突检查: 触摸的软件 SPI 会不会踩到 LCD 的引脚?
+ *
+ * 【为什么要写死一条断言】"一碰屏就花屏"最容易被怀疑的硬伤就是
+ *   触摸的位操作打到了 LCD 的 CS/SCK/MOSI(比如 XPT2046 和 ILI9341 共总线,
+ *   只靠片选区分; 那么拉低 T_CS 的同时必然搅乱 LCD 的传输)。
+ *   这个怀疑【已经排除】, 依据有两条, 都是实证不是推断:
+ *     1) 代码: 触摸用 PC20/PC21/PC22/PC23 + IRQ PC09(本文件), LCD 用
+ *        PC10(SCLK)/PC11(CS)/PC12(MISO)/PC13(MOSI) + RS PC04/RST PC03/LED PC08
+ *        (见 LCDHw.h 的 LCD_PAD_*), 两组引脚不相交;
+ *     2) 原理图: HPM6EMotorV20.pdf 的 J10(16 脚显示口)网络表
+ *        (build/schematic_text.txt)里, J10.3~9 = LCD 的 CS/RESET/DC/MOSI/
+ *        SCLK/LED/MISO -> PC11/PC03/PC04/PC13/PC10/PC08/PC12,
+ *        J10.10~14 = T_SCLK/T_CS/T_MOSI/T_MISO/T_IRQ -> PC20/PC21/PC23/PC22/PC09。
+ *        两组是【排针上各自独立的走线】, 不是"共总线 + 双片选"的接法。
+ *   所以触摸花屏不是引脚冲突, 而是刷屏通路本身的问题(见 LCDHw.c 的说明)。
+ *
+ * 下面这条断言的作用是: 以后再有人改引脚, 编译期就会直接报错, 不会退化成
+ * "偶发花屏"这种上板才发现的玄学问题。 */
+#define TC_PIN_SAME(a, b)   (((a) == (b)) ? 1 : 0)
+#define TC_PIN_CONFLICTS                                                      \
+    (TC_PIN_SAME(LCD_PAD_CS,   TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_CS,   TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_CS,   TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_CS,   TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_CS,   TC_GPIO_IRQ)                                              + \
+     TC_PIN_SAME(LCD_PAD_SCLK, TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_SCLK, TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_SCLK, TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_SCLK, TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_SCLK, TC_GPIO_IRQ)                                              + \
+     TC_PIN_SAME(LCD_PAD_MISO, TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_MISO, TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_MISO, TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_MISO, TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_MISO, TC_GPIO_IRQ)                                              + \
+     TC_PIN_SAME(LCD_PAD_MOSI, TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_MOSI, TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_MOSI, TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_MOSI, TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_MOSI, TC_GPIO_IRQ)                                              + \
+     TC_PIN_SAME(LCD_PAD_RS,   TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_RS,   TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_RS,   TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_RS,   TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_RS,   TC_GPIO_IRQ)                                              + \
+     TC_PIN_SAME(LCD_PAD_RST,  TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_RST,  TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_RST,  TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_RST,  TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_RST,  TC_GPIO_IRQ)                                              + \
+     TC_PIN_SAME(LCD_PAD_LED,  TC_GPIO_SPICS)   + TC_PIN_SAME(LCD_PAD_LED,  TC_GPIO_SPICLK) + \
+     TC_PIN_SAME(LCD_PAD_LED,  TC_GPIO_SPIMISO) + TC_PIN_SAME(LCD_PAD_LED,  TC_GPIO_SPIMOSI) + \
+     TC_PIN_SAME(LCD_PAD_LED,  TC_GPIO_IRQ))
+
+#if (TC_PIN_CONFLICTS != 0)
+/* 【故意用 ASCII】避免编译器把中文错误信息按本地代码页输出成乱码。 */
+#error "LCD/Touch pin overlap: XPT2046 bit-banged SPI must NOT share SCK/MOSI/MISO/CS with the ILI9341 LCD!"
+#endif
+
 void TC_GPIOInit(void)
 {
 	u32 padctl;

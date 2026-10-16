@@ -2,6 +2,11 @@
 #ifndef __LCD_H
 #define __LCD_H		
 
+/* IOC_PAD_xxx / u8 / u16 来自 board.h(-> hpm_common.h -> soc 的 ioc 寄存器头)。
+ * 这里显式包含一次: 本头文件对外暴露 LCD_PAD_* 引脚宏, 别的 .c 只 include
+ * 本文件时也必须能解析这些宏。 */
+#include "board.h"
+
 //LCD重要参数集
 typedef struct  
 {										    
@@ -23,6 +28,56 @@ extern _lcd_dev lcddev;	//管理LCD重要参数
 //定义LCD的尺寸
 #define LCD_W 320
 #define LCD_H 240
+
+/* ======================= LCD 引脚(PAD)定义 =======================
+ * 【为什么要在这里集中定义】原来这些引脚宏散在 LCDHw.c 的 #define 里, 结果
+ * 无法对"触摸的软件 SPI 引脚有没有和 LCD 撞车"做编译期检查 —— 那正是
+ * "一碰屏幕就花屏"最容易被怀疑的硬伤(见 LCDTouch.c 顶部的编译期断言)。
+ *
+ * 【本板实测接线(不是猜的)】来源: HPM6EMotorV20.pdf 原理图 J10(16 脚显示口)
+ * 的网络表(build/schematic_text.txt 里 J10 那一段):
+ *   J10.3  = CS     -> PC11       J10.10 = T_SCLK -> PC20
+ *   J10.4  = RESET  -> PC03       J10.11 = T_CS   -> PC21
+ *   J10.5  = DC/RS  -> PC04       J10.12 = T_MOSI -> PC23
+ *   J10.6  = MOSI   -> PC13       J10.13 = T_MISO -> PC22
+ *   J10.7  = SCLK   -> PC10       J10.14 = T_IRQ  -> PC09
+ *   J10.8  = LED    -> PC08
+ *   J10.9  = MISO   -> PC12
+ * 即 LCD(SPI1) 与触摸(XPT2046, 软件 SPI)在【排针上就是两组独立的线】,
+ * 不是"共总线 + 两个片选"的接法。 */
+#define LCD_PAD_CS    IOC_PAD_PC11   /* 片选(软件 GPIO)   */
+#define LCD_PAD_SCLK  IOC_PAD_PC10   /* SPI1.SCLK         */
+#define LCD_PAD_MISO  IOC_PAD_PC12   /* SPI1.MISO         */
+#define LCD_PAD_MOSI  IOC_PAD_PC13   /* SPI1.MOSI         */
+#define LCD_PAD_RS    IOC_PAD_PC04   /* 数据/命令选择     */
+#define LCD_PAD_RST   IOC_PAD_PC03   /* 复位              */
+#define LCD_PAD_LED   IOC_PAD_PC08   /* 背光              */
+
+/* ---------------- 像素通路自检数据(用于定位"长条/花屏"到底是哪一步丢数据) ----------------
+ * 由 LCDHw.c 统计, 显示任务每 5 秒走日志队列打一行(见 lcd_app.c)。
+ *
+ * 【为什么要区分 busy 和 timeout】这两个返回值是**唯一**能真正丢数据的路径
+ * (hpm_spi_drv.c):
+ *   - status_spi_master_busy : spi_transfer() 开头发现 SPIACTIVE 还置着, 直接返回,
+ *                              【一个字节都没发】。对 LCD 来说 = 这条命令/参数被吞了。
+ *   - status_timeout         : spi_wait_for_idle_status() 的 5000 次重试耗尽而返回
+ *                              (注意: 此时数据其实还在往外移, 超时的是"等待"),
+ *                              调用者若把它当失败处理就会提前收尾/抬 CS。
+ * 反过来, spi_write_data() 只会在 TXFULL 时空转, 【不会丢字节】——所以
+ * "轮询被抢占 -> 少发几个字节"这个链条是不成立的, 必须靠这两个计数来定案。 */
+typedef struct {
+    u32 chunk_count;       /* 成功写出的数据块数(512B/块) */
+    u32 busy_count;        /* spi_transfer 返回 status_spi_master_busy 的次数 */
+    u32 timeout_count;     /* spi_transfer 返回 status_timeout 的次数 */
+    u32 fail_count;        /* 其它失败(status_fail 等) */
+    u32 byte_cmd_fail;     /* 单字节命令/参数(SPI_WriteByte)失败次数 */
+    u32 retry_count;       /* 因失败重发同一块的次数 */
+    u32 band_abort_count;  /* 重发仍失败、放弃本条 band 剩余像素的次数 */
+    u32 last_status;       /* 最近一次 spi_transfer 的返回值(hpm_stat_t) */
+} lcd_tx_stats_t;
+
+void LCD_GetTxStats(lcd_tx_stats_t *out);
+
 
 //TFTLCD部分外要调用的函数		   
 extern u16  POINT_COLOR;//默认红色    

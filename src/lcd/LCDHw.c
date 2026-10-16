@@ -13,10 +13,12 @@
 
 #define LCD_GPIO_CTRL  HPM_GPIO0
 
-#define LCDGPIO_CS   IOC_PAD_PC11       //片选引脚            PB11
-#define LCDGPIO_LED  IOC_PAD_PC08       //背光控制引脚        PB9
-#define LCDGPIO_RS   IOC_PAD_PC04       //寄存器/数据选择引脚 PB10 
-#define LCDGPIO_RST  IOC_PAD_PC03       //复位引脚            PB12
+/* 引脚定义集中在 LCDHw.h(LCD_PAD_*), 这样 LCDTouch.c 能对"触摸软件 SPI 有没有
+ * 撞 LCD 引脚"做编译期断言(见 LCDTouch.c 顶部)。这里保留原来的名字做别名。 */
+#define LCDGPIO_CS   LCD_PAD_CS         /* 片选引脚        PC11 */
+#define LCDGPIO_LED  LCD_PAD_LED        /* 背光控制引脚    PC08 */
+#define LCDGPIO_RS   LCD_PAD_RS         /* 寄存器/数据选择 PC04 */
+#define LCDGPIO_RST  LCD_PAD_RST        /* 复位引脚        PC03 */
 
  
 //GPIO置位（拉高）
@@ -148,19 +150,66 @@ int LCD_SPIInit(void)
 }
 
 
+/* ======================================================================
+ *  像素通路失败计数 —— 定位"不规则长条 / 花屏"的证据
+ *
+ * 【为什么需要它】hpm_spi_drv.c 的 spi_write_data() 只会在 TX FIFO 满时空转,
+ * 【不会丢字节】: 被中断/任务抢占只是让它变慢。所以"轮询写被抢占 -> 少发几个
+ * 字节"这条因果链是站不住的, 不能当结论写。
+ *
+ * 真正能丢数据的只有 spi_transfer() 的两个返回值(hpm_spi_drv.c:434~503):
+ *   · status_spi_master_busy : 进函数时发现 SPIACTIVE 还置着 -> 立刻返回,
+ *                              【一个字节都没发】。对 LCD 来说 = 这条命令/参数/
+ *                              整块像素被吞掉。
+ *   · status_timeout         : spi_wait_for_idle_status() 的 5000 次重试耗尽后
+ *                              返回(超时的是"等待空闲", 数据其实还在往外移)。
+ * 注意这两个是【量级相当】的: 一次 512B 传输在 25MHz 下要 164us, 而 5000 次
+ * 空转在几百 MHz 的核上只有几十~几百 us —— 到底会不会踩到, 必须实测。
+ *
+ * 原来的代码: 前者 printf 一行了事(显示任务里同步写 921600bps 串口!), 后者
+ * 完全被忽略。这里改成分类计数, 由显示任务每 5 秒走日志队列汇总一行,
+ * 上板跑一次就能判断到底有没有丢、丢的是哪一类。
+ * ====================================================================== */
+static lcd_tx_stats_t s_lcd_stats;
+
+static void lcd_stat_fail(hpm_stat_t stat)
+{
+	s_lcd_stats.last_status = (u32)stat;
+	if (stat == status_spi_master_busy) {
+		s_lcd_stats.busy_count++;
+	} else if (stat == status_timeout) {
+		s_lcd_stats.timeout_count++;
+	} else {
+		s_lcd_stats.fail_count++;
+	}
+}
+
+void LCD_GetTxStats(lcd_tx_stats_t *out)
+{
+	if (out == NULL) {
+		return;
+	}
+	*out = s_lcd_stats;
+}
+
 u8 SPI_WriteByte(u8 data)
 {
 	u8 recivedata = 0U;
 	spi_control_config_t control_config;
+	hpm_stat_t stat;
 
 	spi_master_get_default_control_config(&control_config);
 	control_config.common_config.trans_mode = spi_trans_write_read_together;
 	control_config.common_config.data_phase_fmt = spi_single_io_mode;
 	control_config.common_config.tx_dma_enable = false;
 	control_config.common_config.rx_dma_enable = false;
-	if (spi_transfer(LCD_SPI, &control_config, NULL, NULL,
-	                 &data, 1U, &recivedata, 1U) != status_success) {
-		printf("spi_transfer fail\n");
+	stat = spi_transfer(LCD_SPI, &control_config, NULL, NULL,
+	                    &data, 1U, &recivedata, 1U);
+	if (stat != status_success) {
+		/* 【显示任务里绝不能 printf】原来这行在 921600bps 下要 ~0.2ms, 而且
+		 * 是最低优先级任务同步写串口。只计数, 汇总交给 lcd_app.c。 */
+		s_lcd_stats.byte_cmd_fail++;
+		lcd_stat_fail(stat);
 	}
 
 	return recivedata;
@@ -177,16 +226,19 @@ u8 SPI_WriteBlock(u8 *data,u32 len)
 		}
 
 		spi_control_config_t control_config;
+		hpm_stat_t stat;
 		spi_master_get_default_control_config(&control_config);
 		control_config.common_config.trans_mode = spi_trans_write_only;
 		control_config.common_config.data_phase_fmt = spi_single_io_mode;
 		control_config.common_config.tx_dma_enable = false;
 		control_config.common_config.rx_dma_enable = false;
-		if (spi_transfer(LCD_SPI, &control_config, NULL, NULL,
-		                 data, transfer_size, NULL, 0U) != status_success) {
-			printf("spi_transfer fail\n");
+		stat = spi_transfer(LCD_SPI, &control_config, NULL, NULL,
+		                    data, transfer_size, NULL, 0U);
+		if (stat != status_success) {
+			lcd_stat_fail(stat);
 			return 1U;
 		}
+		s_lcd_stats.chunk_count++;
 		data += transfer_size;
 		len -= transfer_size;
 	}
@@ -284,12 +336,14 @@ void Lcd_WriteData_Block(u8 *data,u32 len)
 }
 
 #define LCD_PIXEL_TRANSFER_BUFFER_SIZE (512U)
+#define LCD_WRITE_RETRY_MAX            (2U)
 
 void LCD_WritePixels(const u8 *data, u32 pixel_count)
 {
 	static u8 transfer_buffer[LCD_PIXEL_TRANSFER_BUFFER_SIZE];
 	u32 chunk_pixels;
 	u32 i;
+	u32 retry;
 
 	LCD_CS_CLR;
 	LCD_RS_SET;
@@ -306,9 +360,25 @@ void LCD_WritePixels(const u8 *data, u32 pixel_count)
 			transfer_buffer[i * 2U + 1U] = (u8)~data[i * 2U];
 		}
 
-		if (SPI_WriteBlock(transfer_buffer, chunk_pixels * 2U) != 0U) {
-			break;
+		/* 【失败为什么改成"重发"而不是 break】
+		 * 原来失败就 break: 这条 band 剩下的像素一个都不发, 后半截保持上一帧的
+		 * 内容 —— 屏幕上正好就是"不规则长条"。而 spi_transfer() 失败里最常见的
+		 * status_spi_master_busy 是"上一笔还在移", 隔一小会儿重发基本就成。
+		 * 所以这里重发 LCD_WRITE_RETRY_MAX 次, 仍失败才放弃并计数
+		 * (band_abort_count); 无论成功失败都继续往后写 —— 因为 busy 时一个字节
+		 * 都没发出, GRAM 写指针没动, 继续写下一块仍然是接着的。
+		 * 【注意】这一步只是"不静默丢数据", 不是对根因下结论: 根因看
+		 * LCD_GetTxStats() 的 busy/timeout 计数。 */
+		retry = 0U;
+		while (SPI_WriteBlock(transfer_buffer, chunk_pixels * 2U) != 0U) {
+			if (retry >= LCD_WRITE_RETRY_MAX) {
+				s_lcd_stats.band_abort_count++;
+				break;
+			}
+			retry++;
+			s_lcd_stats.retry_count++;
 		}
+
 		data += chunk_pixels * 2U;
 		pixel_count -= chunk_pixels;
 	}

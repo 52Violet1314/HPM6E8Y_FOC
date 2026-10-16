@@ -21,16 +21,40 @@
 #include "lcd_ui.h"
 #include "touch_calibration.h"
 #include "lvgl.h"
+#include "app_log.h"        /* 汇总统计走日志队列(不阻塞刷屏) */
 
 #define TFT_HOR_RES                 (320U)
 #define TFT_VER_RES                 (240U)
 #define LVGL_DRAW_BUFFER_LINES      (20U)
+
+/* ==================== 诊断开关(排查"长条/花屏"用) ====================
+ * LCD_APP_TRACE_FLUSH: 前 4 次 flush 打一行 area 坐标(和 LCD_SetWindows 的入参
+ *   是同一组数), 用来确认 LVGL 给我们的就是"我们以为的那条 band"。
+ *   排查完改成 0。
+ * LCD_APP_TEST_CRITICAL_FLUSH: 实验用 —— 把整条 band 的传输包在
+ *   taskENTER_CRITICAL()/taskEXIT_CRITICAL() 里(禁止任务切换)。
+ *   用来回答"长条是不是任务级抢占造成的"。
+ *   【必须知道它的局限】configMAX_SYSCALL_INTERRUPT_PRIORITY = 4, 优先级 1 的
+ *   电流环 ADC 中断不受内核临界区影响, 照样会插进来 —— 所以这个实验只能排除
+ *   "任务切换", 不能排除"20kHz 电流环中断"。要排除中断, 得临时
+ *   intc_m_disable_irq(BOARD_BLDC_ADC_IRQn)(见报告里的实验 2b), 那种改法会让
+ *   电流环停跑, 只能在电机静止时做。
+ *   【测完必须改回 0】1.3ms 的临界区不能留在正式代码里。 */
+#define LCD_APP_TRACE_FLUSH           (1)
+#define LCD_APP_TRACE_FLUSH_COUNT     (4U)
+#define LCD_APP_TEST_CRITICAL_FLUSH   (0)
 
 #define HPM_LVGL_MCHTMR            HPM_MCHTMR
 #define HPM_LVGL_MCHTMR_CLK        clock_mchtmr0
 
 extern u8 CMD_RDX;
 extern u8 CMD_RDY;
+
+/* ---- 刷屏统计(每 5 秒汇总一行, 见 lcd_app_task_handler) ---- */
+static u32 s_flush_count;        /* flush 调用次数 */
+static u32 s_flush_pixels;       /* 累计写出的像素数 */
+static u32 s_area_max_pixels;    /* 单次 area 最大像素数 */
+static u32 s_stat_tick;          /* 5s 节流(本任务 5ms 一拍) */
 
 /* LVGL 互斥锁 (在 lcd_app_ui_init 里建, 那时还没起调度器 -> 单线程, 无需加锁) */
 static SemaphoreHandle_t s_lvgl_mtx;
@@ -86,10 +110,37 @@ static void lcd_flush_cb(lv_display_t *display, const lv_area_t *area,
 {
     uint32_t width = (uint32_t)(area->x2 - area->x1 + 1);
     uint32_t height = (uint32_t)(area->y2 - area->y1 + 1);
+    uint32_t pixels = width * height;
+
+    s_flush_count++;
+    s_flush_pixels += pixels;
+    if (pixels > s_area_max_pixels) {
+        s_area_max_pixels = pixels;
+    }
+
+#if LCD_APP_TRACE_FLUSH
+    /* 只打前几次: 确认 LVGL 给的 area 与 LCD_SetWindows 的入参一致(实验 3)。
+     * 走日志队列 -> 由日志任务写串口, 显示任务不会被串口拖住。 */
+    if (s_flush_count <= LCD_APP_TRACE_FLUSH_COUNT) {
+        LOG_I("LCD", "flush#%u area=(%d,%d)-(%d,%d) %ux%u pix=%u",
+              (unsigned)s_flush_count, (int)area->x1, (int)area->y1,
+              (int)area->x2, (int)area->y2,
+              (unsigned)width, (unsigned)height, (unsigned)pixels);
+    }
+#endif
+
+#if LCD_APP_TEST_CRITICAL_FLUSH
+    taskENTER_CRITICAL();       /* 实验 2a: 禁止任务切换(不影响优先级 1 的电流环中断) */
+#endif
 
     LCD_SetWindows((u16)area->x1, (u16)area->y1,
                    (u16)area->x2, (u16)area->y2);
-    LCD_WritePixels(pixel_map, width * height);
+    LCD_WritePixels(pixel_map, pixels);
+
+#if LCD_APP_TEST_CRITICAL_FLUSH
+    taskEXIT_CRITICAL();
+#endif
+
     lv_display_flush_ready(display);
 }
 
@@ -221,6 +272,35 @@ void lcd_app_task_handler(void)
         (void)lv_timer_handler();
 
         lcd_app_lvgl_unlock();
+    }
+
+    /* ---- 每 5 秒汇总一行"像素通路"统计(判断到底有没有丢数据) ----
+     * 本任务周期 5ms(见 app_rtos.c) -> 1000 拍 = 5s。
+     * 【这一行是定案用的证据, 不是普通日志】
+     *   chunk = 成功写出的 512B 块数;
+     *   busy  = spi_transfer 返回 status_spi_master_busy 的次数
+     *           (进函数时 SPIACTIVE 还置着 -> 这条命令/整块像素一个字节都没发);
+     *   tmo   = 返回 status_timeout 的次数(等 SPI 空闲的 5000 次重试耗尽);
+     *   retry/abort = 单块重发次数 / 重发仍失败后放弃该 band 剩余像素的次数
+     *           (abort > 0 且 busy/tmo > 0 => "不规则长条"有了确定来源);
+     *   若 busy/tmo/abort 恒为 0, 说明一个字节都没丢, "长条"就必须去查
+     *   LVGL 侧(area/render/flush_ready 时序), 见报告的实验 1 结论分支。
+     * 【为什么不放在 LCDHw.c】驱动层不打日志; 这里只做一次 vsnprintf + 入队,
+     *   真正的串口写出由日志任务做, 不会拖慢刷屏。 */
+    s_stat_tick++;
+    if (s_stat_tick >= 1000U) {
+        lcd_tx_stats_t st;
+
+        s_stat_tick = 0U;
+        LCD_GetTxStats(&st);
+        LOG_I("LCD",
+              "5s: flush=%u pix=%u areamax=%u chunk=%u busy=%u tmo=%u fail=%u retry=%u abort=%u cmd=%u last=%u",
+              (unsigned)s_flush_count, (unsigned)s_flush_pixels,
+              (unsigned)s_area_max_pixels,
+              (unsigned)st.chunk_count, (unsigned)st.busy_count,
+              (unsigned)st.timeout_count, (unsigned)st.fail_count,
+              (unsigned)st.retry_count, (unsigned)st.band_abort_count,
+              (unsigned)st.byte_cmd_fail, (unsigned)st.last_status);
     }
 }
 
