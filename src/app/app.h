@@ -57,6 +57,30 @@ extern "C" {
  * 若发现电流偏大而转矩偏小, 可以试 80~100 之间微调。 */
 #define APP_ENC_LEAD_DEG            (90.0f)
 
+/* ================= 用【离线标定的 3200 组查表】算电角度 =================
+ *
+ *   1 = 电角度不再由公式算, 而是直接查表:
+ *           elec_rad  = app_enc_lut(raw)              (app_encoder 里)
+ *           vec_angle = elec_rad + APP_ENC_LEAD_DEG   (app_run 换向时)
+ *
+ *       表在 src/app/app_enc_lut.c, 由 tools/enc_lut_build.py 从"静态角度扫描"
+ *       的串口日志离线生成 (3200 组 = 5.12 counts/组, 已含极对数换算、安装偏置
+ *       和编码器自身的周期误差; 实测该误差按电周期重复, 幅度约 ±300 mrad)。
+ *
+ *   效果: app_encoder_get_elec_rad() 返回的就是表值, 于是
+ *         - 换向 (app_run) 用它;
+ *         - 电流环的 Park 变换用它;
+ *         - 遥测第 2 列 (enc_elec) 和第 4 列 (lut) 也是它。
+ *
+ *   【与下面几个开关的关系】本开关 = 1 时:
+ *         - 不加载 Flash 里的 LUT/偏置存档 (那是喂运行时 diag_lut 的);
+ *         - 不做静态扫描标定, 也不跑运行时查表学习/自动换向 ——
+ *           APP_CAL_SWEEP_ENABLE / APP_ENC_LUT_* 被本开关旁路 (但仍保留编译,
+ *           因为体检日志还要打印 sweep 进度)。
+ *
+ *   0 = 回到原来的路径: app_encoder 线性公式 (mech×极对数+偏置) + 运行时标定。 */
+#define APP_ENC_USE_BUILTIN_LUT     (1)
+
 /* ================= 编码器角度查表 (1024 点 LUT) =================
  *
  *   APP_ENC_LUT_LEARN = 1 -> 边跑边建表: 每个控制周期把 (编码器原始角,
@@ -89,15 +113,243 @@ extern "C" {
  * 换向/转速测试时必须关掉 (它会周期性把转子"刹"一下)。表已经抄完, 关。 */
 #define APP_ENC_LUT_DUMP_TICKS      (0U)
 
-/* FOC 电流环 (需要先知道相电阻/电感并整定好 PI; 与编码器换向互斥) */
-#define APP_FOC_CLOSED_LOOP_ENABLE  (0)
+/* ================= 电流环跑在哪里 =================
+ *
+ *   1 = 跑在 ADC 完成中断里 (20kHz) —— 【正式用法, 默认】
+ *       采样 -> 计算 PI -> 更新占空比, 严格在同一个载波周期内完成, 没有主循环延迟。
+ *       为什么必须这样: 本电机电气时间常数 τ = Ls/Rs = 1.3mH/3.1Ω = 0.42ms,
+ *       比 1kHz 主循环周期(1ms)还短 —— 在 1kHz 里调这个对象, 无论怎么整定都在悬崖边。
+ *       实测: 1kHz + ωc=40Hz 时低速勉强能用, 一到 100RPM 以上电流就失控(顶限幅/假过流)。
+ *       搬进中断后 ts = 50us, 带宽可以放到几百 Hz。
+ *
+ *   0 = 跑在 1kHz 主循环里 (旧做法, 只用于对比/回退)。
+ *
+ * 注意: 中断里做不了编码器读取(bit-bang 一次几十微秒), 角度由主循环算好放在
+ *       s_isr_elec_rad 里给中断用, 最多滞后 1ms (160RPM 时约 5 度电角度)。 */
+#define APP_CURRENT_LOOP_IN_ISR     (1)
+/* ADC 完成中断频率 = PWM 载波频率 (采样由 PWM 触发) */
+#define APP_ADC_ISR_FREQ_HZ         (20000U)
+/* 12V 母线下的相电压上限, 用于电流的"物理可及变化率"限幅 (= Vmax/√3·0.95): */
+#define APP_FOC_VMAX_V              (6.9f)
+
+/* 过流保护要连续超限多少拍才真正锁死 (去抖):
+ * 实测出现过单拍 10A 的假值(开关噪声把运放打飞), 单拍就锁死会让整个运行被一次毛刺打断。 */
+#define APP_FOC_OC_TRIP_CNT         (3U)
+
+/* ADC 采样存活看门狗 (始终生效, 不可关): 中断次数掉到期望值的 1/4 以下就封锁输出并报警。
+ * 期望值按【实测主循环周期累加出的真实窗口时长】算, 不假设窗口就是 1 秒。 */
+/* 每秒打印一行 ADC 中断统计 (实测次数 / 期望次数 / 最大间隔 us):
+ *   0 = 【默认】不打。那些数字受主循环实际周期影响, 正常时看着也像故障, 容易误判;
+ *       真出问题时看门狗自己会报。
+ *   1 = 排障用。查"电流环被卡住/电流环失准"时打开: 最大间隔远大于 50us
+ *       就说明中断被别的 ISR 或临界区拖住了(实测见过 15ms)。 */
+#define APP_LOG_ISR_STAT            (1)
+
+/* ================= 控制任务节拍体检 =================
+ *
+ *   1 = 【排障用】每秒打一行 app_run() 的实测周期统计:
+ *         avg/max = 本窗口内控制循环周期的平均值与最大值 (ms)
+ *         bad     = 周期 > APP_CTRL_PERIOD_WARN_MS 的次数
+ *       上 RTOS 之后控制任务由 vTaskDelayUntil 锁 1ms, 但它仍然会被
+ *       【同优先级/更高优先级】【长临界区】【关中断的长操作】拖慢 —— 而 FOC 的
+ *       换向角是拿"主循环实测 dt"算的, 周期一旦抖到几毫秒, 电流矢量就会指错方向
+ *       (表现就是电机堵转/顿挫)。这行就是用来证明/排除这件事的。
+ *
+ *   0 = 不打印 (稳定后可以关掉)。 */
+#define APP_LOG_CTRL_PERIOD        (1)
+
+/* 控制周期超过这个值 (ms) 就计一次 bad, 并在日志里把最大值打出来。
+ * 1kHz 的环路上, 单拍超过 2ms 已经足以让 300RPM 的转子丢拍。 */
+#define APP_CTRL_PERIOD_WARN_MS    (2U)
+
+/* [ENC] 编码器体检行的打印间隔 (ms, 按主循环名义周期累计)。
+ * 这行原本每秒一次、185 字符 —— 在 115200 baud 下每次占满串口线 16ms,
+ * 后面的遥测只能排队, 看起来就是"每次打这条就卡一下"。
+ * 现在: 间隔 5 秒 + 精简掉只在上电扫描阶段才有意义的字段(开机日志里已经有了)。 */
+#define APP_ENC_HEALTH_MS           (5000U)
+
+/* ADC 采样点定标:
+ *   0 = 【默认】直接用回绕点(cmp=1)。按 bsp_pwm.c 的对称比较值推出, 那里就是
+ *       "三相下桥同时导通"窗口的中心, 离两侧开关沿最远; 实测各候选点的抖动差异
+ *       都落在噪声底内, 没必要扫, 简单可靠。
+ *   1 = 开机在回绕点附近细扫, 按电流读数抖动选最小点。仅作实验用:
+ *       本板电流读数噪声底就有 100~300mA 峰峰值, 候选点差异被淹没, 判据不灵敏,
+ *       而且曾因此选中"ADC 不触发"的死点(见 bsp_pwm.c 里的夹取保护)。 */
+#define APP_ADC_TRIG_SCAN           (0)
+#define APP_ADC_TRIG_WIN            (400U)
+
+/* ================= FOC 电流环 (闭环) =================
+ *
+ *   1 = 使能电流环。换向角仍来自内置查表 (APP_ENC_USE_BUILTIN_LUT), 但电压不再
+ *       是"固定幅值 + 超前角", 而是由 id/iq 的 PI 算出来:
+ *           测量三相电流 -> Clarke/Park(用表给出的转子电角度) -> id/iq
+ *           -> PI -> ud/uq -> 反 Park + SVPWM
+ *       【注意】闭环模式下 app.c 不再叠加 APP_ENC_LEAD_DEG 超前角 —— 那是
+ *       开环电压矢量才需要的东西 (Park 变换已经自动把矢量放到 q 轴)。
+ *
+ *   0 = 回到开环电压矢量 (查表换向 + 固定电压幅值)。
+ *
+ * 【整定依据】Ls = 1.3mH, Rs(视在, 实测) ≈ 3.1Ω, 带宽 300Hz —— 因为电流环已经
+ *   搬到 20kHz 的 ADC 中断里 (ts=50us), 推导见 foc_config.h:
+ *       Kp = Ls·ωc = 2.45 V/A,  Ki = Rs·ωc = 5844 V/(A·s) */
+#define APP_FOC_CLOSED_LOOP_ENABLE  (1)
 
 #define APP_FOC_ID_REF_A            (0.0f)    /* d 轴电流给定 (A), 通常为 0 */
-#define APP_FOC_IQ_REF_A            (1.0f)    /* q 轴电流给定 (A), 起步用小值 */
-#define APP_FOC_CURRENT_KP          (1.0f)    /* 电流环 Kp */
-#define APP_FOC_CURRENT_KI          (300.0f)  /* 电流环 Ki */
-#define APP_FOC_RPM_LIMIT           (100.0f)  /* 软转速限幅 (RPM): 超过就把 iq 清零 */
-#define APP_FOC_OC_LIMIT_A          (5.0f)    /* 过流硬保护阈值 (A) */
+/* q 轴电流给定 (A)。实测视在相电阻约 3.1Ω, 0.3A 只要约 1V, 是安全的起步点;
+ * 想加力就往上加 (注意 foc_config.h 的 FOC_CURRENT_LIMIT_A=2A 会夹住给定)。 */
+#define APP_FOC_IQ_REF_A            (0.3f)
+/* 电流环增益: 必须与"跑在哪里"配套 —— 中断里 ts=50us, 主循环里 ts=1ms,
+ * 同一组数换环境用会差 20 倍(积分), 直接振荡。所以这里按开关自动选。 */
+#if APP_CURRENT_LOOP_IN_ISR
+#define APP_FOC_CURRENT_KP          (2.45f)   /* ts=50us,  ωc=300Hz: Ls*ωc */
+#define APP_FOC_CURRENT_KI          (5844.0f) /* ts=50us,  ωc=300Hz: Rs*ωc */
+#else
+#define APP_FOC_CURRENT_KP          (0.33f)   /* ts=1ms,  ωc=40Hz (旧路径) */
+#define APP_FOC_CURRENT_KI          (779.0f)
+#endif
+#define APP_FOC_RPM_LIMIT           (1000.0f)  /* 软转速限幅 (RPM): 超过就把 iq 清零 */
+
+/* ================= 转速给定 (LCD 速度条 / 外部设定) =================
+ *
+ * 【目标转速从哪来】app_speed_target_set() 写一个目标值, app_run 每拍在
+ *   app_speed_apply() 里按下面两个开关决定怎么用它。上电默认值就是下面的宏,
+ *   所以不接 UI、不调 setter 时行为与改这个特性之前完全一致。
+ *
+ * 【滑条量程】LCD 界面 (lcd_ui.h) 的量程是 0..600 RPM; 本宏是默认落点。
+ *   默认取满量程 (600) = 【不额外限速】, 见下面的说明。 */
+/* 【默认值 = 不额外限速】非常关键的一条:
+ *   上电默认取 APP_SPEED_TARGET_MAX_RPM (600), 而软限速的语义是
+ *   "目标达到/超过满量程就不额外限速" (见 app.c 的 app_speed_apply 里的闭环段),
+ *   所以一上电这个特性是【完全旁路】的, 电机行为和没有速度条时一模一样;
+ *   只有用户真的去拖速度条, 限速才生效。 */
+#define APP_SPEED_TARGET_DEFAULT_RPM    (600.0f)
+/* 速度目标的绝对上限 (保护): setter 会被夹到这个值以内。 */
+#define APP_SPEED_TARGET_MAX_RPM        (600.0f)
+
+/* 速度环: 用转速误差算 iq 给定 (真正"设多少转多少")。
+ *
+ *   1 = 使能: app_run 里用 app_speed_pi() 的输出替代固定的 APP_FOC_IQ_REF_A。
+ *       控制律: e = target - rpm;  iq = Kp·e + ∫Ki·e·dt (夹在电流限幅内)
+ *       正负号由【编码器方向】决定 —— 若实测给定正转速时电机反而减速/反转,
+ *       把 APP_FOC_SPEED_KP / KI 取负即可。
+ *   0 = 【默认】速度环不接管。此时目标转速按下面的"软限速"用法生效。
+ *
+ * 【为什么默认 0】速度环一旦使能, 电机行为就完全变了 (它会自己去追目标转速),
+ *   而这台机器现在还在做电流环/换向调试。默认保持原有行为, 需要时再打开。
+ *
+ * 【现已改为 1】因为位置环 (APP_MOTION_ENABLE) 必须靠它做内环 —— 见下面
+ *   "位置环"一节。位置环每拍都会重写速度给定, 所以"上电 600RPM"的默认目标
+ *   不会真的让电机去追 600; 若把 APP_MOTION_ENABLE 设回 0 又不想让电机自转,
+ *   记得把这里也改回 0。 */
+#define APP_FOC_SPEED_LOOP_ENABLE   (1)
+
+#if APP_FOC_SPEED_LOOP_ENABLE
+/* 速度环 PI (1kHz 下发, ts = 1ms)。
+ *   机械时间常数远大于电时间常数, 所以速度环要比电流环慢得多:
+ *     Kp = 0.02 A/RPM -> 1000RPM 误差给 20A, 被 FOC_CURRENT_LIMIT_A 夹住;
+ *         实际工作点 (误差几十 RPM) 给 1~2A, 对应约 0.03~0.06 N·m。
+ *     Ki = 0.5 A/(RPM·s) -> 100RPM 误差约 3 秒积到 1A。
+ *   调法: 先只加 Kp 到"能追但不抖", 再加 Ki 消静差; 抖就同时减。 */
+#define APP_FOC_SPEED_KP            (0.02f)
+#define APP_FOC_SPEED_KI            (0.5f)
+/* 速度环输出的 iq 幅值上限 (A)。必须 <= APP_FOC_OC_LIMIT_A, 否则速度环会
+ * 自己把电流顶到过流保护上去。 */
+#define APP_FOC_SPEED_IQ_LIMIT_A    (1.5f)
+#endif
+
+/* 没有速度环时, 目标转速的用法:
+ *   0 = 软限速: 目标转速就是"允许的最高转速", 超过就按 APP_FOC_RPM_KNEE 的比例
+ *       线性减弱 iq (与原来 APP_FOC_RPM_LIMIT 的逻辑完全一致, 只是上限由滑条给)。
+ *       转速仍然上不去也下不来 —— 转矩是给定值, 转速由负载决定。
+ *   1 = 开环速度给定: 直接把目标转速写给开环电压矢量的电频率
+ *       (foc_controller_set_speed_rpm), 未做编码器换向时就是 V/F 调速。
+ *       注意: 走内置查表换向 (APP_ENC_USE_BUILTIN_LUT=1 且换向已生效) 时,
+ *       矢量角度由编码器决定, 开环积分被 set_external_angle 停掉, 这个值无意义。 */
+#define APP_SPEED_OPENLOOP_DIRECT   (1)
+
+/* 目标转速的爬升/下降速率 (RPM/s)。速度条可以一手指拖到底, 直接前馈跳变会让
+ * 开环电频率一步跳过去 (转子跟不上 -> 失步/过流折叠), 速度环也会吃到巨大的
+ * 阶跃误差。所以下发给开环频率给定前先按这个速率爬。600 RPM 满量程约 1.2s。
+ * 调试时想看阶跃响应, 改成很大的值 (例如 1.0e9f) 即可。 */
+#define APP_SPEED_RAMP_RPM_S        (500.0f)
+/* 软限速的拐点: 从 RPM_LIMIT×这个比例 开始线性减弱 iq, 到 RPM_LIMIT 减到 0。
+ * 原来是"超过 90% 砍到 30%"的开关式, 实测把转速打成了 86~143RPM 的来回冲
+ * (0.3A 转矩每毫秒能把这个小惯量转子变速 26RPM), 转动震动明显。 */
+#define APP_FOC_RPM_KNEE            (0.5f)
+
+/* ================= 位置环 (外环) =================
+ *
+ * 【分层】位置环 --P--> 速度给定 RPM  →  速度环(app.c, APP_FOC_SPEED_LOOP_ENABLE)
+ *         --PI--> iq  →  电流环(ADC 中断 20kHz) --PI--> ud/uq
+ *
+ * 【硬性依赖】用位置环必须同时把 APP_FOC_SPEED_LOOP_ENABLE 打开 (=1)。
+ *   位置环只给"速度给定", 内环速度环提供阻尼; 少了内环就是双积分 + 纯 P,
+ *   必然振荡, 而且速度给定只会退化成"软限速上限", 位置环等于没接上。
+ *   所以下面把 APP_FOC_SPEED_LOOP_ENABLE 一并打开了 —— 这会让 LCD 速度条从
+ *   "限速"变成"速度指令"(语义更正确), 是上位置环的必然结果。
+ *
+ * 【增益怎么定】位置环是外环, 要比速度环慢 5~10 倍:
+ *   内环(速度)按 ωc≈10Hz 设计, 则位置环取 2π×5Hz = 31.4 rad/s。
+ *   而速度给定的单位是 RPM, 所以 pos_kp [RPM/rad] = 31.4/9.549 ≈ 3.3, 取 3.0。
+ *   若响应太软就按比例加大, 出现超调/来回摆就减小(优先调这个, 不用碰内环)。 */
+#define APP_MOTION_ENABLE           (1)        /* 0 = 完全不用位置环(回到原行为) */
+#define APP_MOTION_POS_KP           (3.0f)     /* (rad 误差) -> RPM */
+#define APP_MOTION_SPEED_LIMIT_RPM  (200.0f)   /* 位置环输出的速度限幅 (RPM) */
+
+/* 上电自动演示: 先原地保持, 之后每 3 秒在 ±90° 之间来回, 直接看位置环效果。
+ * 想自己给目标就置 0, 然后调 app_motion_set_target(&s_motion, rad)。 */
+#define APP_MOTION_DEMO_ENABLE      (1)
+#define APP_MOTION_DEMO_PERIOD_MS   (3000U)
+#define APP_MOTION_DEMO_STEP_RAD    (1.5707963f)   /* 90° */
+/* 过流硬保护阈值 (A): 一旦超过立刻封锁输出并锁死 (需复位)。
+ * 【注意它保护的不是极性】12V 母线、5.4Ω 相电阻下, 堵转电流上限只有
+ * Vmax/R = (12/√3×0.95)/5.4 ≈ 1.2A —— 也就是说正常工况根本够不到 2A。
+ * 这个阈值防的是"电流采样坏掉/功率级短路"这类异常, 不是防极性接反。
+ * 极性反了的表现是: 电流被 PI 推到【负】方向饱和(~ -1.2A) 或直接不转,
+ * 靠 APP_CURRENT_SIGN_AUTOTEST 那个自检来保证, 别指望这里兜底。 */
+#define APP_FOC_OC_LIMIT_A          (2.0f)
+
+/* ================= 初始电流校准 (使能电机之前做) =================
+ *
+ *   1 = 上电初始化时, 在【封锁 PWM 输出】的状态下采集相电流零点:
+ *           duty 写零矢量 -> 封锁输出 -> bsp_adc_calibrate() 取 256 个新样本平均
+ *       校准完才打开输出、才使能控制器。(顺序反了零点里会混进真实电流)
+ *
+ *   0 = 用理论中点 65535/2 当零点 (不校准)。 */
+#define APP_ADC_OFFSET_CAL_ENABLE   (1)
+
+/* 相电流极性: 低边采样电阻测到的电流方向取决于运放接法, 弄反了电流环必发散。
+ *   0    = 上电自检自动判定 (默认, 见下面 APP_CURRENT_SIGN_AUTOTEST)
+ *   +1/-1 = 强制指定, 不做自检 */
+#define APP_CURRENT_SIGN            (0.0f)
+
+/* 电流传感自检: 在校准之后、闭环使能之前, 用【开环】把电压矢量分别钉在
+ * 0/90/180/270° 四个角度上各一小会儿 (APP_CURRENT_SIGN_TEST_MV, 默认 500mV ->
+ * 3Ω 下约 0.16A, 很安全), 记录三相电流, 然后穷举
+ *      【6 种相序排列 × 2 种极性】
+ * 用"测得的电流矢量是否跟着施加的电压矢量走"打分, 取最高分作为电流传感的正确接法。
+ * 结论 (极性 sign + 相序 map) 都会打进日志。
+ *
+ * 【为什么必须四个角度】只测 0° 只能定整体极性: 0° 时 V/W 两相电流本来就相等,
+ * 所以"V/W 通道互换"这种错位在那个角度【完全看不出来】—— 但它是数学上的"镜像",
+ * 会让闭环反馈变成 2θ 调制的坏反馈, 表现为电压一路顶到限幅 + 过流锁死。 */
+#define APP_CURRENT_SIGN_AUTOTEST   (1)
+#define APP_CURRENT_SIGN_TEST_MV    (500U)     /* 自检电压 (mV) */
+#define APP_CURRENT_SIGN_TEST_MS    (150U)     /* 每个角度保持时间 (ms), 末段再采样 */
+
+/* 闭环方向验证: 4 角度探测定的是"电流传感怎么接", 但那是【开环】下直接用 iα/iβ
+ * 算的, 没有经过 Park 变换。这里再用【电流环自己】把整条反馈路径验一遍:
+ *     只开 P (Ki=0 -> 电压 = Kp×误差, 天然有界, 绝不可能 windup 到限幅),
+ *     给一个不大的 iq 给定, 看测到的 iq 朝正方向还是负方向走。
+ *     反向 -> 说明反馈里还有一次镜像 -> 自动取反再来一遍。
+ * 因为只用 P 且给定不大, 即使方向判错, 电流也只会停在 100mA 量级, 绝对安全。
+ *   0 = 跳过这一步 (只信 4 角度探测)。 */
+#define APP_CURRENT_LOOP_VERIFY     (1)
+#define APP_CURRENT_LOOP_VERIFY_A   (0.5f)     /* 验证用 iq 给定 (A) */
+#define APP_CURRENT_LOOP_VERIFY_MS  (30U)      /* 每趟跑多少拍 (ms, 1kHz) */
+/* 验证专用 P 增益: 故意取得比正式 Kp 大, 目的是把电流抬到 100mA 量级便于判方向。
+ * 只用 P 所以电压天然有界: i = Kp·ref/(R+Kp) ≈ 0.1A, 电压 ≈ 0.33V, 绝对安全。 */
+#define APP_CURRENT_VERIFY_KP       (0.82f)
 
 /* 调试用: 只把电压矢量固定在一个电角度上(转子被"吸住"/对齐), 不旋转。
  *   0 = 正常旋转开环 (默认)
@@ -350,6 +602,65 @@ void app_init(void);
  * @note   建议每 APP_MAIN_LOOP_MS(1ms) 调用一次。
  */
 void app_run(void);
+
+/* ================= 转速接口 (给 LCD / 上位机用) =================
+ *
+ * 【RTOS 下的跨任务约定】显示任务 (LVGL) 和控制任务 (app_run) 是两个任务,
+ * 所以这些函数的"谁能从哪个任务调"是有讲究的:
+ *
+ *   任意任务可调 (只读标量 / 只写一个对齐 float, 不需要锁):
+ *       app_speed_get_rpm()     读编码器估算值 (控制任务刚写的 float)
+ *       app_speed_get_target()  读目标值
+ *       app_speed_target_set()  写目标值 —— 显示任务的滑条回调就调它
+ *       app_speed_target_pending()  读走并清"目标刚变过"标志
+ *       app_speed_is_running() / app_speed_is_calibrating()  读状态快照
+ *
+ *   只能控制任务调:
+ *       app_speed_apply()       把目标值下发到控制环 (app_run 里已经调了)
+ *
+ *   这些函数都【不许在中断里调】。
+ */
+
+/** @return 实测机械转速 (RPM, 带符号; 编码器估算值经低通, 未使能时为 0) */
+float app_speed_get_rpm(void);
+
+/** @return 当前目标转速 (RPM)。上电默认 APP_SPEED_TARGET_DEFAULT_RPM。 */
+float app_speed_get_target(void);
+
+/**
+ * @brief  取"经过斜坡、真正作用到控制环"的目标转速 (RPM)
+ * @note   目标值是斜坡着下发的 (见 APP_SPEED_RAMP_RPM_S)。界面用它显示
+ *         "斜坡中 120/300 RPM", 这样用户拖完滑条能看出还在爬。
+ *         与控制任务共享的是 volatile 快照, 从显示任务读安全。
+ */
+float app_speed_get_target_eff(void);
+
+/**
+ * @brief  设定目标转速 (RPM) —— 可从任意任务调用 (例如 LVGL 滑条回调)
+ * @param  rpm  目标值; 会被夹到 [-APP_SPEED_TARGET_MAX_RPM, +APP_SPEED_TARGET_MAX_RPM]
+ * @note   只写一个 volatile float, 不碰控制器也不碰日志, 所以显示任务里调用是
+ *         安全的; 真正的下发由控制任务在 app_speed_apply() 里做 (写者唯一化)。
+ */
+void app_speed_target_set(float rpm);
+
+/**
+ * @brief  把目标转速下发到控制环 (每拍一次, 只能由控制任务调用)
+ * @note   app_run() 内部已经调用, 单独暴露只是为了自检/单测时手动驱动。
+ */
+void app_speed_apply(void);
+
+/**
+ * @brief  取走"目标转速刚被改过"的标志 (读走即清)
+ * @return 1 = 距上次调用以来目标值变过
+ * @note   给显示任务做"已下发"反馈用; 读走即清意味着只有一个读者。
+ */
+uint8_t app_speed_target_pending(void);
+
+/** @return 1 = 电机受控运行中 (闭环已使能且未过流), 0 = 未使能/已封锁 */
+uint8_t app_speed_is_running(void);
+
+/** @return 1 = 正在标定/静态扫描 (此时目标转速不参与控制) */
+uint8_t app_speed_is_calibrating(void);
 
 #ifdef __cplusplus
 }

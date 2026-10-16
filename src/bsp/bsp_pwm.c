@@ -50,6 +50,7 @@
 
 static uint32_t s_reload;       /* 载波重载值 */
 static uint32_t s_duty_max;     /* 乘 0.98 防饱和 */
+static uint32_t s_adc_trig = 1U;/* 当前 ADC 触发比较值 (采样时刻) */
 
 /**
  * @brief  更新某一相的占空比(往一对 shadow 比较值里写值)
@@ -295,10 +296,24 @@ void bsp_pwm_enable_output(bool enable)
     uint32_t i;
 
     if (enable) {
-        /* 打开输出 = 取消软件强制, 让硬件按比较值正常输出波形 */
+        /* 打开输出 = 【彻底】解除软件强制, 让硬件按比较值正常输出波形。
+         *
+         * 【三样都得清, 少一样输出就永远出不来】
+         *   1) GLB_CTRL.SW_FORCE[ch]     软件强制触发位 (封锁时置 1)
+         *   2) CFG1.SW_FORCE_EN          强制源 = 软件 (封锁时置 1)
+         *   3) FORCE_MODE[ch] = no_force 强制电平 (封锁时被设成 force_output_0)
+         * 原先只清了第 1 项, 于是"封锁 -> 恢复"之后通道仍被按在低电平:
+         * 现象就是【电机一点不转】(PWM 引脚上也量不到波形)。
+         * 这条路径以前只在过流锁死时用过(那时不需要恢复), 所以一直没暴露。 */
         for (i = 0; i < 6; i++) {
             pwmv2_disable_software_force(BSP_PWM, (pwm_channel_t)s_all_channels[i]);
         }
+        pwmv2_shadow_register_unlock(BSP_PWM);
+        for (i = 0; i < 6; i++) {
+            pwmv2_force_output(BSP_PWM, s_all_channels[i], pwm_force_output_no_force, false);
+            pwmv2_disable_force_by_software(BSP_PWM, s_all_channels[i]);
+        }
+        pwmv2_shadow_register_lock(BSP_PWM);
         return;
     }
 
@@ -328,4 +343,41 @@ void bsp_pwm_enable_output(bool enable)
 uint32_t bsp_pwm_get_reload(void)
 {
     return s_reload;
+}
+
+/**
+ * @brief  运行时设置 ADC 触发比较值 (= 采样时刻在 PWM 周期里的位置)
+ *
+ * 【为什么需要运行时改】采样点必须落在"三相下桥同时导通、且远离开关沿"的位置。
+ *   本 PWM 的比较值是对称构造的 (cmp = reload/2 ∓ cmp_half), 所以下桥导通窗口
+ *   以计数器回绕点为中心, 半宽 = reload/2 × (1 - 0.98×duty_max):
+ *       duty=0.5 -> 12.8us   duty=0.9 -> 2.95us   duty=0.98 -> 1.0us (扣死区后更少)
+ *   调制越深窗口越窄, 固定一个值在高调制下就可能踩到开关沿(实测出现过 10A 的假
+ *   采样值)。所以支持运行时改, 配合 app.c 里的"采样点扫描"用最小抖动点定标。
+ *
+ * 对照 STM32: 就是改 TIMx->CCR4 (触发 ADC 的那个比较通道), 位置换算成本一样。
+ */
+void bsp_pwm_set_adc_trig_count(uint32_t cmp)
+{
+    /* 【必须夹住, 不能等于 reload】实测把触发点设成 reload(9999) 时 ADC 根本不触发:
+     * 读数被冻结 -> 抖动为 0 -> 扫描反而挑中它; 更严重的是 ADC 中断随之停摆,
+     * 电流环的占空比冻结在最后一拍, 电机直接不转(中招过一次)。
+     * 所以这里保证触发点严格落在周期内部 [1, reload-1]。 */
+    if (cmp < 1U) {
+        cmp = 1U;
+    } else if (cmp >= s_reload) {
+        cmp = s_reload - 1U;
+    }
+    s_adc_trig = cmp;
+    pwmv2_shadow_register_unlock(BSP_PWM);
+    pwmv2_set_shadow_val(BSP_PWM, BSP_PWM_SHADOW_TRIG, cmp, 0, false);
+    pwmv2_shadow_register_lock(BSP_PWM);
+}
+
+/**
+ * @brief  读取当前 ADC 触发比较值 (= 采样时刻)
+ */
+uint32_t bsp_pwm_get_adc_trig_count(void)
+{
+    return s_adc_trig;
 }

@@ -12,8 +12,8 @@
 #define FOC_MOTOR_POLE_PAIRS            (11.0f)     /* 4015 中空电机极对数 */
 /* 相电阻/相电感未知: 先用开环驱动 (foc_openloop) 调试, 不依赖这两个值;
  * 等实际测量(万用表测线电阻/电感表)后再填入, 用于电流环 PI 整定。 */
-#define FOC_MOTOR_RS_OHM                (5.4f)      /* 相电阻 (Ω); 若 5.4Ω 是线间值，需改为 2.7Ω */
-#define FOC_MOTOR_LS_HENRY              (0.0013f)   /* 相电感 (H); 若 1.3mH 是线间值，需改为 0.65mH */
+#define FOC_MOTOR_RS_OHM                (5.4f)      /* 相电阻 (Ω) —— 实测确认按【相】值填 */
+#define FOC_MOTOR_LS_HENRY              (0.0013f)   /* 相电感 (H) = 1.3mH —— 同样按相值 */
 #define FOC_MOTOR_FLUX_WB               (0.0f)      /* 磁链 (Wb), 未知填 0 */
 
 /* ---- 编码器安装 ---- */
@@ -58,9 +58,27 @@
 #define FOC_USE_HPM_MATH                (1)
 #define FOC_TRIG_TABLE_SIZE             (2048U)     /* sin 表点数, 2 的幂; 2048 -> 8KB */
 
-/* ---- 电流环 PI (按带宽法预估: Kp = Ls*ωc, Ki = Rs*ωc) ---- */
-#define FOC_DEFAULT_CURRENT_KP          (5.0f)
-#define FOC_DEFAULT_CURRENT_KI          (200.0f)
+/* ---- 电流环 PI (带宽法: Kp = Ls*ωc, Ki = Rs*ωc) ----
+ *
+ * 参数: Ls = 1.3 mH; R 用【实测的视在值】—— 开机自检里 500mV 对应约 160mA,
+ *   反推 Rs ≈ 3.1 Ω (含电流换算误差, 但它正是环路实际"看到"的电阻)。
+ *
+ * 【关键前提: 电流环跑在 20kHz 的 ADC 中断里】(见 app.h 的 APP_CURRENT_LOOP_IN_ISR)
+ *   本电机 τ = Ls/Rs = 0.42ms, 比 1kHz 主循环周期还短 —— 在 1kHz 里调它,
+ *   无论怎么整定都在悬崖边(实测: ωc=40Hz 低速勉强, 100RPM 以上就失控)。
+ *   搬进 ADC 完成中断后 ts = 50us, 采样→计算→更新占空比在同一载波周期内完成,
+ *   延迟只剩约 1 个 PWM 周期, 带宽可以放到几百 Hz。
+ *
+ * ωc = 2π×300 = 1885 rad/s
+ *     Kp = Ls×ωc = 0.0013 × 1885 = 2.45   V/A
+ *     Ki = Rs×ωc = 3.1    × 1885 = 5844   V/(A·s)
+ *   延迟相位 ≈ ωc×50us = 5.4°, 加采样保持 2.7° -> 相位裕度约 82°, 很稳。
+ *   (若想更快可以按同样公式提到 500Hz: Kp=4.08/Ki=9740, 但先确认这版稳定。)
+ *
+ * PI 实现见 foc_pi_run(): out = kp·e + 积分, 积分 += ki·ts·e, 故 Ki 单位 V/(A·s)。 */
+#define FOC_CURRENT_BW_HZ               (300.0f)
+#define FOC_DEFAULT_CURRENT_KP          (2.45f)     /* = Ls * ωc */
+#define FOC_DEFAULT_CURRENT_KI          (5844.0f)   /* = Rs * ωc */
 
 /* ---- 限幅 ---- */
 #define FOC_CURRENT_LIMIT_A             (2.0f)      /* d/q 电流限幅 (A) */

@@ -9,6 +9,8 @@
 
 #include <string.h>
 
+#include "app.h"            /* APP_ENC_USE_BUILTIN_LUT */
+#include "app_enc_lut.h"    /* 离线标定的 3200 组 raw -> 电角度表 */
 #include "bsp_mt6701.h"
 
 static float s_elec_offset_rad = FOC_ELEC_ANGLE_OFFSET;
@@ -44,7 +46,17 @@ bool app_encoder_update(app_encoder_t *enc)
     enc->mech_rpm = speed_rad_s * (60.0f / FOC_TWO_PI);
 
     /* 电角度 = 机械角度 * 极对数 + 安装偏置 (偏置可被校准存档覆盖) */
+#if APP_ENC_USE_BUILTIN_LUT
+    /* 【查表法】电角度直接由离线标定的表给出。
+     * 表值是"编码器读到这个 raw 时, 能让转子停在这个位置的磁场电角度",
+     * 因此它已经包含了: 极对数换算、安装偏置、以及编码器自身的周期误差
+     * (实测按电周期重复, 幅度约 ±300 mrad)。
+     * 【方向已含在表里】本安装下 raw 增大时电角度是【下降】的, 不要再乘
+     * FOC_ENCODER_DIRECTION —— 那个系数只作用于 mech_rad (速度估算用)。 */
+    enc->elec_rad = app_enc_lut_elec_rad(enc->raw_angle);
+#else
     enc->elec_rad = foc_mech_to_elec(enc->mech_rad, s_elec_offset_rad);
+#endif
 
     return is_new;
 }

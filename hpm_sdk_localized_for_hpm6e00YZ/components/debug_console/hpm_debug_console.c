@@ -140,10 +140,24 @@ __attribute__((used)) int  __SEGGER_RTL_X_file_flush(__SEGGER_RTL_FILE *__stream
 
 #endif
 
-int _write(int file, char *data, int size)
+/* 【本项目修改: 非阻塞控制台】
+ * 原实现是"一个字符一个字符 while(uart_send_byte())" 再 uart_flush(), 纯阻塞:
+ *   115200 baud 只有 11.5 字符/ms, 一行 185 字符的 [ENC] health 日志会把主循环
+ *   卡住约 16ms —— 实测现象就是"打印一大串数据时电机突然顿一下"(角度被冻结,
+ *   电流矢量指错方向)以及编码器丢拍。
+ *
+ * 现在改成调用 bsp_console_write():
+ *   - 项目里对它有【强定义】(src/app/app.c: 环形缓冲 + UART TX 中断, 入队即返回,
+ *     满了就丢弃, 绝不等待), 链接时会覆盖这里的弱定义;
+ *   - 这里的弱定义保留原来的阻塞实现作为兜底, 保证 SDK 单独编译时行为不变。
+ * 这样 printf 和项目日志走同一条非阻塞路径, 也不会两个写入者抢同一个 UART。
+ *
+ * 【注意必须加 noinline】否则编译器会把这里的弱定义直接在 _write() 里内联展开,
+ * 链接器就没有机会用项目里的强定义覆盖它 —— 补丁会静默失效(实测踩过)。
+ * 加了 noinline 才会在这里生成"对符号 bsp_console_write 的调用", 由链接器选强定义。 */
+ATTR_WEAK __attribute__((noinline)) int bsp_console_write(const char *data, int size)
 {
     int count;
-    (void)file;
     for (count = 0; count < size; count++) {
         if (data[count] == '\n') {
             while (status_success != uart_send_byte(g_console_uart, '\r')) {
@@ -155,6 +169,12 @@ int _write(int file, char *data, int size)
     while (status_success != uart_flush(g_console_uart)) {
     }
     return count;
+}
+
+int _write(int file, char *data, int size)
+{
+    (void)file;
+    return bsp_console_write(data, size);
 }
 
 int _read(int file, char *s, int size)

@@ -146,6 +146,16 @@ void  foc_speed_est_init(foc_speed_est_t *est, float ts, float lpf_alpha);
  */
 float foc_speed_est_update(foc_speed_est_t *est, float mech_angle);
 
+/**
+ * @brief  更新速度估算用的时间步长 (每拍调用, 传【实测】周期)
+ * @param  ts  本次采样的实际间隔 (s), 必须 > 0
+ * @note   speed = Δangle / ts。ts 是名义值而实际周期变长时, 算出的转速会
+ *         按比例偏大 (1ms 的名义值 + 5ms 的实际周期 = 5 倍假转速)。上 RTOS 后
+ *         控制任务的周期会被显示/日志任务挤长, 所以这个 ts 必须每拍刷新。
+ *         取值合理性由调用者负责 (本函数只挡 <= 0 的非法值)。
+ */
+void  foc_speed_est_set_ts(foc_speed_est_t *est, float ts);
+
 #ifdef __cplusplus
 }
 #endif

@@ -136,8 +136,17 @@ void foc_update(foc_t *foc, float ia, float ib, float ic, float elec_angle, floa
     foc->elec_angle = elec_angle;
     foc->vdc = vdc;
 
-    /* SVPWM 线性区最大相电压 = vdc/√3, 留 5% 余量 */
-    vmax = vdc * FOC_ONE_BY_SQRT3 * 0.95f;
+    /* SVPWM 线性区最大相电压 = vdc/√3。
+     *
+     * 【为什么只取 85%, 而不是 95%】这 15% 不是给电压留的, 是给【电流采样】留的。
+     *   低边采样只能在"三相下桥同时导通"的窗口里做, 该窗口以 PWM 计数器回绕点为
+     *   中心, 半宽 = reload/2×(1-0.98×duty_max)。占空比越极端窗口越窄:
+     *       向量=0.85×线性极限 -> duty 约 0.075~0.925 -> 窗口半宽约 465 counts = 2.3us ✓
+     *       向量=0.95×线性极限 -> duty 约 0.03 ~0.97  -> 窗口半宽约 190 counts = 0.95us
+     *   后者再扣掉死区, 采样点几乎贴在开关沿上 —— 实测就是这样采到过 10A 的假值
+     *   (12V+3.1Ω 下即使相间短路也只有 1.9A, 物理上不可能), 把整个运行打断。
+     *   标准做法就是留"调制余量", 代价只是最高电压少 10%。 */
+    vmax = vdc * FOC_ONE_BY_SQRT3 * 0.85f;
     foc->v_limit = vmax;
     foc->id_pi.out_limit = vmax;
     foc->iq_pi.out_limit = vmax;
@@ -238,4 +247,11 @@ float foc_speed_est_update(foc_speed_est_t *est, float mech_angle)
     est->speed += est->lpf_alpha * (raw - est->speed);
 
     return est->speed;
+}
+
+void foc_speed_est_set_ts(foc_speed_est_t *est, float ts)
+{
+    if ((est != NULL) && (ts > 0.0f)) {
+        est->ts = ts;
+    }
 }

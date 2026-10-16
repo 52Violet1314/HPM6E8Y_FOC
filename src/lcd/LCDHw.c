@@ -129,9 +129,12 @@ int LCD_SPIInit(void)
     timing_config.master_config.clk_src_freq_in_hz = src_clk;
     timing_config.master_config.sclk_freq_in_hz = best_sclk;
     if (spi_master_timing_init(LCD_SPI, &timing_config) != status_success) {
-        printf("spi_master_timing_init fail\n");
+        printf("[LCD] spi_master_timing_init FAIL (src=%u, want=%u)\n", src_clk, best_sclk);
         return -1;
     }
+    /* 日志里留一行实参: ILI9341 串行写周期最小 100ns(=10MHz), 超太多初始化就会失败 */
+    printf("[LCD] SPI1 src_clk=%u Hz -> sclk=%u Hz (target %u)\n",
+           src_clk, best_sclk, (unsigned)LCD_SPI_SCLK_FREQ);
 
     spi_master_get_default_format_config(&format_config);
     format_config.common_config.data_len_in_bits = LCD_SPI_DATA_LEN_BITS;

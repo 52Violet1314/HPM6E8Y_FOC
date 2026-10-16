@@ -64,6 +64,20 @@ void bsp_pwm_set_duty(bsp_pwm_phase_t phase, float duty);
 void bsp_pwm_set_duty_uvw(float du, float dv, float dw);
 
 /**
+ * @brief  运行时设置 ADC 触发比较值 (= 采样时刻在 PWM 周期内的位置)
+ * @param  cmp  计数值; 内部会夹到 [1, reload-1]
+ * @note   采样点应落在"三相下桥全导通且远离开关沿"处(即计数器回绕点附近)。
+ *         注意 cmp 不能等于 reload: 实测那样 ADC 根本不触发, 电流环的占空比
+ *         会冻结在最后一拍 —— 函数内部已做夹取保护。
+ */
+void bsp_pwm_set_adc_trig_count(uint32_t cmp);
+
+/**
+ * @brief  读取当前 ADC 触发比较值
+ */
+uint32_t bsp_pwm_get_adc_trig_count(void);
+
+/**
  * @brief  获取 PWM 计数重载值 (载波周期 tick 数)
  * @return reload 值; 对照 STM32: 相当于 TIMx->ARR
  */

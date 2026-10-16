@@ -60,6 +60,9 @@ static uint32_t s_adc_v_buff[BOARD_BLDC_ADC_PMT_DMA_SIZE_IN_4BYTES];
 static volatile uint16_t s_cur_u_raw;
 static volatile uint16_t s_cur_v_raw;
 static volatile bool s_cur_ready;
+/* 采样帧计数: 每完成一次 PWM 触发的电流采样 +1。
+ * 零点校准必须"等新样本"再取, 不能紧循环连读 —— 那样读到的是同一个值。 */
+static volatile uint32_t s_cur_frame;
 
 /* 应用层注册的电流采样完成回调 (中断上下文调用) */
 static bsp_adc_conv_cb_t s_conv_cb;
@@ -102,6 +105,7 @@ void bsp_adc_isr(void)
         /* 取原始码值(16bit): DMA 缓冲是 uint32_t, 低 16 位有效 */
         s_cur_u_raw = (uint16_t)(s_adc_u_buff[BSP_ADC_SLOT] & 0xFFFFU);
         s_cur_v_raw = (uint16_t)(s_adc_v_buff[BSP_ADC_SLOT] & 0xFFFFU);
+        s_cur_frame++;
         s_cur_ready = true;                                               /* 告诉主循环"有新数据" */
 
         if (s_conv_cb != NULL) {
@@ -368,18 +372,32 @@ void bsp_adc_get_currents_ma(int32_t *iu, int32_t *iv, int32_t *iw)
     /* counts -> mA: counts * Vref_mV / FS / (Rshunt_ohm * gain) */
     const int32_t iu_cnt = (int32_t)s_cur_u_raw - (int32_t)s_cur_u_offset;   /* 减去零点偏移 */
     const int32_t iv_cnt = (int32_t)s_cur_v_raw - (int32_t)s_cur_v_offset;
-    /* shunt_ohm = mohm/1000, gain = GAIN_X10/10  => 分母 *10000
-     * 推导: I_mA = counts * Vref_mV / (FS * R_shunt_ohm * gain)
-     *            = counts * Vref_mV * 10000 / (FS * R_mohm * G_X10)
-     * 之前这里乘的是 10, 结果小了 1000 倍(电流一直显示接近 0, 限流形同虚设)。 */
-    const int32_t denom = (int32_t)BSP_ADC_CURRENT_SHUNT_MOHM * (int32_t)BSP_ADC_CURRENT_GAIN_X10;
-    /* 用 int64 中间量防溢出: 码值 * 3300 * 10000 会超过 32bit */
-    int32_t u_ma = (denom != 0) ? (int32_t)(((int64_t)iu_cnt * BSP_ADC_REF_MV * 10000) / ((int64_t)BSP_ADC_FULL_SCALE * denom)) : 0;
-    int32_t v_ma = (denom != 0) ? (int32_t)(((int64_t)iv_cnt * BSP_ADC_REF_MV * 10000) / ((int64_t)BSP_ADC_FULL_SCALE * denom)) : 0;
+    int32_t u_ma = bsp_adc_counts_to_ma(iu_cnt);
+    int32_t v_ma = bsp_adc_counts_to_ma(iv_cnt);
 
     if (iu) { *iu = u_ma; }
     if (iv) { *iv = v_ma; }
     if (iw) { *iw = -(u_ma + v_ma); }
+}
+
+/**
+ * @brief  把"相对零点的 ADC 码值"换算成电流 (mA)
+ *
+ * 推导: I_mA = counts * Vref_mV / (FS * R_shunt_ohm * gain)
+ *              = counts * Vref_mV * 10000 / (FS * R_mohm * G_X10)
+ * (R_shunt_ohm = R_mohm/1000, gain = G_X10/10, 所以分母补 x10000)
+ * 与 bsp_adc_get_currents_ma 用同一套参数, 便于把零点偏差直接打成 mA。
+ */
+int32_t bsp_adc_counts_to_ma(int32_t counts)
+{
+    const int32_t denom = (int32_t)BSP_ADC_CURRENT_SHUNT_MOHM * (int32_t)BSP_ADC_CURRENT_GAIN_X10;
+
+    if (denom == 0) {
+        return 0;
+    }
+    /* 用 int64 中间量防溢出: 码值 * 3300 * 10000 会超过 32bit */
+    return (int32_t)(((int64_t)counts * BSP_ADC_REF_MV * 10000)
+                     / ((int64_t)BSP_ADC_FULL_SCALE * denom));
 }
 
 /**
@@ -453,20 +471,47 @@ int32_t bsp_adc_get_temperature_mc(void)
  * 对照 STM32: 等价于 FOC 初始化时的 "offset calibration" —— 关 PWM,
  *             多次读 ADC 求平均, 存入 Ia_offset/Ib_offset。
  *
- * @note   实现上是连续读 N 次全局变量(由中断持续刷新), 因此调用期间应保证
- *         PWM 已关闭且 ADC 触发仍在运行, 才能采到真实零点。
+ * @note   实现上是"等新样本"再取: 电流采样由 PWM 以 20kHz 硬件触发, 若在紧循环里
+ *         连读全局变量, 256 次读到的其实是同一个值(平均没有任何意义)。
+ *         这里用 s_cur_frame 帧计数, 每取一个样本都等到新的一帧, 因此
+ *         BSP_ADC_OFFSET_SAMPLES=256 对应约 12.8ms 的真实平均。
  */
 void bsp_adc_calibrate(void)
 {
     uint32_t i;
     uint32_t u_sum = 0;
     uint32_t v_sum = 0;
+    uint32_t last = s_cur_frame;
 
-    for (i = 0; i < BSP_ADC_OFFSET_SAMPLES; i++) {
+    for (i = 0U; i < BSP_ADC_OFFSET_SAMPLES; i++) {
+        uint32_t guard = 0U;
+
+        /* 等一个新样本 (PWM 20kHz -> 约 50us 一个); guard 防止 PWM 没跑时死等 */
+        while ((s_cur_frame == last) && (guard < 2000000U)) {
+            guard++;
+        }
+        if (s_cur_frame == last) {
+            break;                          /* 一直没新帧: 退化成本次值, 不卡死 */
+        }
+        last = s_cur_frame;
         u_sum += s_cur_u_raw;
         v_sum += s_cur_v_raw;
     }
+
+    if (i == 0U) {
+        return;
+    }
     /* 平均值作为零点, 后续换算全部减去它 */
-    s_cur_u_offset = (uint16_t)(u_sum / BSP_ADC_OFFSET_SAMPLES);
-    s_cur_v_offset = (uint16_t)(v_sum / BSP_ADC_OFFSET_SAMPLES);
+    s_cur_u_offset = (uint16_t)(u_sum / i);
+    s_cur_v_offset = (uint16_t)(v_sum / i);
+}
+
+/**
+ * @brief  读取当前使用的相电流零点 (原始码值)
+ * @param  u,v  输出指针, 可传 NULL
+ */
+void bsp_adc_get_offsets(uint16_t *u, uint16_t *v)
+{
+    if (u != NULL) { *u = s_cur_u_offset; }
+    if (v != NULL) { *v = s_cur_v_offset; }
 }

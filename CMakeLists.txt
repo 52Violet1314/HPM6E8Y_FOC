@@ -20,6 +20,11 @@ set(CONFIG_HPM_MATH 1)
 # application-owned until the panel controller and pinout are selected.
 set(CONFIG_LVGL 1)
 set(CONFIG_LVGL_CUSTOM_PORTABLE 1)
+# FreeRTOS: 显示与打印各派一个任务, 控制任务锁 1ms 硬周期。
+#   中间件已拷入本地化 SDK: hpm_sdk_localized_for_hpm6e00YZ/middleware/FreeRTOS
+#   配置见 src/rtos/FreeRTOSConfig.h, 任务划分见 src/rtos/app_rtos.c
+#   CherryUSB 会自动切到 usb_osal_freertos.c (它的 CMakeLists 里判的就是这个开关)
+set(CONFIG_FREERTOS 1)
 
 # ---- 构建类型 (HPM_BUILD_TYPE) ----
 #   ram       : 链接到 ILM/RAM (入口 0x0)。SDK 默认值。
@@ -90,7 +95,15 @@ sdk_app_src(src/app/app.c)
 sdk_app_src(src/app/app_diag.c)
 sdk_app_src(src/app/app_log.c)
 sdk_app_src(src/app/app_encoder.c)
+# 位置环 (外环): 位置误差 -> 速度给定, 内环是 app.c 里的速度环
+sdk_app_src(src/app/app_motion.c)
+# 离线标定的 3200 组"编码器 raw -> 电角度"查表 (tools/enc_lut_build.py 生成)
+sdk_app_src(src/app/app_enc_lut.c)
 sdk_app_src(src/app/app_nv.c)
+
+# ---- RTOS: 任务划分 (控制 / 日志 / 显示) ----
+sdk_inc(src/rtos)
+sdk_app_src(src/rtos/app_rtos.c)
 
 sdk_app_src(src/main.c)
 generate_ide_projects()

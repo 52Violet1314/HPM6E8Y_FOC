@@ -73,6 +73,16 @@ void app_log_write(app_log_level_t level, const char *tag, const char *fmt, ...)
  */
 void app_log_write_raw(const char *line);
 
+/**
+ * @brief  日志任务的循环体 (由 RTOS 的日志任务调用, 内部不返回)
+ *
+ * 【为什么要有它】LOG_* 现在只把"格式化好的行"塞进队列, 真正的后写出
+ * (串口环形缓冲 + USB 提交) 由这个任务做。这样控制任务里不再有 vsnprintf
+ * 和 USB 相关逻辑, 1kHz 节拍更稳。
+ * 队列满时整行丢弃(绝不阻塞), 因为日志永远不该拖慢控制。
+ */
+void app_log_task_body(void);
+
 #ifdef __cplusplus
 }
 #endif

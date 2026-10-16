@@ -164,7 +164,15 @@
 #define BOARD_CONSOLE_UART_RX_DMA_REQ HPM_DMA_SRC_UART1_RX
 #endif
 #endif
-#define BOARD_CONSOLE_UART_BAUDRATE (115200UL)
+/* 【本项目修改】控制台波特率 115200 -> 921600。
+ * 原因: 本工程每秒要吐 [ENC] health(约185字符) + [FOC] 日志 + 100Hz 遥测,
+ *   115200 baud 只有 11.5 字符/ms, 光那条 health 就占用串口线 16ms ——
+ *   主循环已经不阻塞了(日志走环形缓冲+TX中断), 但串口带宽被它吃满,
+ *   后面排队的遥测要等 16ms, 看起来就是"每次打这条就卡一下"。
+ *   提到 921600 后同样的内容只占 2ms, 富余 8 倍。
+ * 【注意】烧写后请把串口助手(或 VS Code 终端)的波特率也改成 921600,
+ *   否则会是乱码。改回 115200 只需把这一行的值改回来。 */
+#define BOARD_CONSOLE_UART_BAUDRATE (921600UL)
 #endif
 #endif
 

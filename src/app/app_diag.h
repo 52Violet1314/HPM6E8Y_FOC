@@ -33,6 +33,12 @@ extern "C" {
 #define APP_STAGE_LOOP_CURRENT      (12U)
 #define APP_STAGE_LOOP_CONTROL      (13U)
 #define APP_STAGE_LOOP_DONE         (14U)
+/* 主循环里的"耗时嫌疑段": 标出来是为了让 ADC 中断在被拖长时能记录
+ * "当时主循环正在干什么"(见 app.c 的 s_isr_gap_stage), 用来定位是谁堵的中断。 */
+#define APP_STAGE_LOOP_ENCODER      (15U)   /* bit-bang 读 MT6701 */
+#define APP_STAGE_LOOP_LCD          (16U)   /* LVGL 任务 + 触摸 + SPI 刷屏 */
+#define APP_STAGE_LOOP_LOG          (17U)   /* 日志格式化/入队 */
+#define APP_STAGE_LOOP_USB          (18U)   /* USB CDC 提交 */
 
 typedef struct {
     uint32_t stage;
