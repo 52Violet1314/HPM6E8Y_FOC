@@ -8,10 +8,21 @@
 #include "app.h"            /* APP_MOTION_* */
 #include "foc_math.h"       /* FOC_PI / FOC_TWO_PI */
 
-/* 方向统一系数: 实测 iq>0 时编码器机械角在减小(FOC_ENCODER_DIRECTION=-1),
- * 取 -1 让"正 iq -> 位置/速度增大"。若上电后表现为正反馈(一使能就冲),
- * 先把这里改成 +1 试。 */
-#define APP_MOTION_DIR_SIGN   (-1.0f)
+/* 方向统一系数。
+ *
+ * 【它统一的是谁】本模块内部的"位置正方向"要和【速度环/电流环的正方向】
+ * 一致, 也就是"正 iq -> 位置读数增大"。而所用的机械角是
+ *      mech_rad = FOC_ENCODER_DIRECTION * mt6701_angle_to_rad(raw)
+ * 所以:
+ *      FOC_ENCODER_DIRECTION = +1  ->  正 iq 让 mech_rad 增大 -> 这里取 +1
+ *      FOC_ENCODER_DIRECTION = -1  ->  正 iq 让 mech_rad 减小 -> 这里取 -1
+ * 写成表达式而不是写死, 就是为了避免"改了 foc_config.h 却忘了改这里"。
+ *
+ * 【注意它现在必须和速度环同号】速度环 (app.c) 是拿 app_encoder_get_mech_rpm()
+ * 和给定比较的, 而那个 rpm 已经含了 FOC_ENCODER_DIRECTION。位置环如果单独
+ * 反号, 两个环就在两个坐标系里, 一使能必然往一个方向冲到底(实测就是这样)。
+ * 改方向只需要改 foc_config.h 的 FOC_ENCODER_DIRECTION, 这里自动跟随。 */
+#define APP_MOTION_DIR_SIGN   (FOC_ENCODER_DIRECTION)
 
 static float motion_wrap_2pi(float a)
 {

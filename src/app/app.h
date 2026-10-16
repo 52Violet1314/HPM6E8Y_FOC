@@ -255,6 +255,32 @@ extern "C" {
 /* 速度环输出的 iq 幅值上限 (A)。必须 <= APP_FOC_OC_LIMIT_A, 否则速度环会
  * 自己把电流顶到过流保护上去。 */
 #define APP_FOC_SPEED_IQ_LIMIT_A    (1.5f)
+
+/* ---- 速度环反馈方向 ----
+ *
+ * 速度环必须是负反馈: 给定 + 转速时, 实测 rpm 也必须朝 + 走。而"实测 rpm 的
+ * 符号"由三件互相独立的事决定: 编码器计数方向 / 相电流极性(开机自检出来的 ±1 /
+ * FOC 电角度约定。任何一处反了, 速度环就变成正反馈 —— 现象是 iq 一路顶到限幅
+ * 而转子被反向拖住(实测日志: iq=+147mA 顶住, rpm=-553)。
+ *
+ *   APP_SPEED_DIR_AUTOTEST = 1 -> 开机实测: 给一个很小的正转速给定, 看 rpm 往
+ *       哪边走, 自动定出符号 (见 app.c 的"速度环方向自检")。
+ *       【前提: 电机必须空载】带载时转子被负载拖住, 判据不可信。
+ *   APP_SPEED_DIR_AUTOTEST = 0 -> 直接用下面的静态值, 不测。
+ *
+ * 静态默认值 +1 —— 因为 foc_config.h 里 FOC_ENCODER_DIRECTION = +1, 即"编码器
+ * 读数增大 = 电机正转"(2026-10-14 校准出来的结论)。若自检报"方向正常"却仍然
+ * 一使能就往一个方向冲, 那就是这条链上还有别的环节反了, 把这里改成 -1。 */
+#define APP_SPEED_DIR_SIGN          (1.0f)
+#define APP_SPEED_DIR_AUTOTEST      (1)
+
+/* 自检用的"速度给定"和持续时间。
+ * 【为什么这么小】自检期间 iq ≈ Kp × 给定 (积分才刚起步), 所以
+ *      iq ≈ 0.02 × 6 = 0.12 A
+ * 对 Kt≈0.03 N·m/A 的这台电机只是轻轻推一下, 6ms 内转速变化个几 RPM,
+ * 判据只看"符号", 不需要转起来。想更明显就把给定加到 20 (iq≈0.4A)。 */
+#define APP_SPEED_DIR_TEST_RPM      (6.0f)
+#define APP_SPEED_DIR_TEST_MS       (6U)
 #endif
 
 /* 没有速度环时, 目标转速的用法:
@@ -661,6 +687,43 @@ uint8_t app_speed_is_running(void);
 
 /** @return 1 = 正在标定/静态扫描 (此时目标转速不参与控制) */
 uint8_t app_speed_is_calibrating(void);
+
+/* ================= 位置环外部接口 (给 LCD / 上位机 / 自检用) =================
+ *
+ * 位置环的实现和分层在 src/app/app_motion.h。这里只暴露"从外面看"需要的东西。
+ *
+ * 【谁能调】以下函数除 app_motion_run() 外, 都只写普通标量, 任意任务可调;
+ * app_motion_run() 由 app_run 在控制任务里每拍调用一次。
+ */
+
+/** @return 1 = 位置环已使能 (APP_MOTION_ENABLE 且 app_run 里已 app_motion_enable(true)) */
+uint8_t app_motion_is_enabled(void);
+
+/** @return 1 = 位置环正在运行 (使能 且 电机闭环受控) */
+uint8_t app_motion_is_running(void);
+
+/** @return 1 = 位置环在这一拍改写了速度给定 (给显示反馈用, 读走即清) */
+uint8_t app_motion_took_over(void);
+
+/** @return 位置环输出的速度给定 (RPM); 未使能时为 0 */
+float app_motion_get_speed_ref(void);
+
+/** @return 目标位置 (rad, 连续多圈) */
+float app_motion_get_target_rad(void);
+
+/** @return 当前位置 (rad, 连续多圈) */
+float app_motion_get_pos_rad(void);
+
+/** @return 位置误差 (rad, 目标-反馈) */
+float app_motion_get_err_rad(void);
+
+/**
+ * @brief  设定目标位置 (rad, 连续多圈)
+ * @note   直接用绝对角度: 例如"往前转 90°"就传 当前位置 + 1.5708。
+ *         上电时位置环会把当前位置设为目标(原地保持), 所以第一次给定要基于
+ *         app_motion_get_pos_rad() 来算, 不要直接传 0。
+ */
+void app_motion_set_target_rad(float pos_rad);
 
 #ifdef __cplusplus
 }

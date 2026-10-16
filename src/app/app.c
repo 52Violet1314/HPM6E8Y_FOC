@@ -57,6 +57,18 @@ static app_motion_t     s_motion;
  * 相关开关 (APP_FOC_SPEED_LOOP_ENABLE / APP_SPEED_OPENLOOP_DIRECT) 见 app.h。 */
 static volatile float s_speed_target_rpm = APP_SPEED_TARGET_DEFAULT_RPM;
 
+/* ---- 速度环反馈方向 (见 app_init 里的"速度环方向自检") ----
+ * 速度环必须是负反馈: 给定 + 时必须看到实测转速也 + 。这个系数把
+ * "速度环坐标系" 和 "编码器/iq 坐标系" 对齐, 由开机自检实测决定;
+ * 不想自检就把它固定成 APP_SPEED_DIR_SIGN (app.h)。 */
+static float s_speed_dir = APP_SPEED_DIR_SIGN;
+
+/* ---- 位置环状态快照 (RTOS 下显示/其它任务只能读这些, 不能碰 s_motion) ---- */
+#if APP_MOTION_ENABLE
+static volatile uint8_t s_motion_running;    /* 1 = 位置环在跑 */
+static volatile uint8_t s_motion_takeover;   /* 1 = 这一拍位置环改写了速度给定 */
+#endif
+
 /* ---- 跨任务状态快照 (只有控制任务里的 app_speed_apply() 会写, 显示任务只读) ----
  * RTOS 起来后显示任务是独立任务, 所以"控制任务正在改的结构体"一律不许给显示
  * 任务直接读 —— 这三个量就是给它的只读快照。详见 app.c 末尾转速接口的注释。 */
@@ -1037,6 +1049,66 @@ void app_init(void)
     LOG_I("MOT", "position loop ON: kp=%d mRPM/rad, 速度限幅=%d RPM",
           (int)(APP_MOTION_POS_KP * 1000.0f), (int)APP_MOTION_SPEED_LIMIT_RPM);
 #endif
+
+    /* ================= 第四步: 速度环反馈方向自检 =================
+     *
+     * 【为什么必须做】速度环是"负反馈", 但反馈回来的 rpm 是否和 iq 同号,
+     * 取决于三件互相独立的事: 编码器计数方向、相电流极性(自检出来是 ±1)、
+     * 以及 FOC 的电角度约定。任何一处反了, 速度环就成了【正反馈】:
+     *     正给定 -> 正的 iq -> 实测转速却是负的 -> 误差更大 -> iq 更大 ...
+     * iq 会一路顶到 APP_FOC_SPEED_IQ_LIMIT_A 饱和, 转子被"反向拖住"。
+     * 实测日志里的现场就是: iq=+147mA(顶到限幅) 而 rpm=-553 —— 正是这个。
+     *
+     * 【怎么测】把速度环给定设成 +APP_SPEED_DIR_TEST_RPM, 只跑
+     * APP_SPEED_DIR_TEST_MS, 然后看实测 rpm 朝哪边走。因为
+     *      |给定| = 测试转速, e ≈ 测试转速, iq ≈ Kp·e
+     * 所以只要把测试转速选得让 Kp·e 落在安全电流内就行 (见 app.h 的宏),
+     * 而且这段时间速度环自己的 PI 会限制电流, 不会失控。
+     * 测出来是负的就把 s_speed_dir 翻成 -1 (之后所有给定/反馈都过这个系数)。
+     *
+     * 【前提】电机必须【空载】—— 带载时转子被负载拖住/反转, 判据不可信。
+     * 不需要这个自检时把 APP_SPEED_DIR_AUTOTEST 置 0, 直接信
+     * APP_SPEED_DIR_SIGN 的静态值。 */
+#if APP_FOC_CLOSED_LOOP_ENABLE && APP_FOC_SPEED_LOOP_ENABLE && APP_SPEED_DIR_AUTOTEST
+    {
+        float    rpm_before;
+        float    rpm_after;
+        float    vbus_f = (float)bsp_adc_get_vbus_mv() * 0.001f;
+        uint32_t i;
+
+        s_speed_dir = APP_SPEED_DIR_SIGN;
+        s_spd_integ = 0.0f;
+
+        rpm_before = app_encoder_get_mech_rpm(&s_encoder);
+        s_speed_target_rpm = APP_SPEED_DIR_TEST_RPM;
+
+        /* 用与运行期完全相同的控制路径跑: 这样"实测速度"就是运行期看到的那个量 */
+        for (i = 0U; i < (APP_SPEED_DIR_TEST_MS / APP_MAIN_LOOP_MS); i++) {
+            app_init_run_cycles(1U, vbus_f);
+            app_speed_apply();
+        }
+
+        rpm_after = app_encoder_get_mech_rpm(&s_encoder);
+
+        s_speed_target_rpm = 0.0f;      /* 回到停止, 交给位置环接管 */
+        s_spd_integ        = 0.0f;
+
+        if (rpm_after < rpm_before) {
+            s_speed_dir = -s_speed_dir;
+            LOG_I("FOC", "速度环方向自检: 给定 +%d RPM -> 实测 %d -> %d RPM, 判定反馈反向, s_speed_dir=%d",
+                  (int)APP_SPEED_DIR_TEST_RPM, (int)rpm_before, (int)rpm_after,
+                  (int)s_speed_dir);
+        } else {
+            LOG_I("FOC", "速度环方向自检: 给定 +%d RPM -> 实测 %d -> %d RPM, 方向正常, s_speed_dir=%d",
+                  (int)APP_SPEED_DIR_TEST_RPM, (int)rpm_before, (int)rpm_after,
+                  (int)s_speed_dir);
+        }
+    }
+#endif
+#if APP_FOC_CLOSED_LOOP_ENABLE
+    LOG_I("FOC", "speed loop: dir=%d, target=%d RPM (位置环每拍会重写它)",
+          (int)s_speed_dir, (int)s_speed_target_rpm);
+#endif
 #if APP_FOC_CLOSED_LOOP_ENABLE
     LOG_I("APP", "motor ENABLED: CURRENT LOOP, iq_ref=%d mA, id_ref=%d mA, Kp=0.%02d V/A, Ki=%d V/(A*s), OC=%d mA",
           (int)(APP_FOC_IQ_REF_A * 1000.0f), (int)(APP_FOC_ID_REF_A * 1000.0f),
@@ -1154,6 +1226,17 @@ void app_speed_apply(void)
         s_speed_ui_last_seen = want;
         s_speed_ui_pending   = 1U;
     }
+
+#if APP_MOTION_ENABLE
+    /* 位置环状态快照。位置环每拍都会改写速度给定, 所以它一旦在跑, 就要把
+     * "目标值变了"这个标志再置一次 —— 因为对用户/界面来说, 真正在动的量是
+     * 位置, 不是速度条; 而速度条的值此刻只是位置环的输出, 拿它当"用户设定"
+     * 会把人误导 (实测就是屏上速度数字乱跳)。 */
+    s_motion_running = (s_motion.enable && (s_speed_ui_running != 0U)) ? 1U : 0U;
+    if (s_motion_takeover != 0U) {
+        s_speed_ui_pending = 1U;
+    }
+#endif
 }
 
 uint8_t app_speed_target_pending(void)
@@ -1182,6 +1265,87 @@ uint8_t app_speed_is_calibrating(void)
     }
 #endif
     return 0U;
+}
+
+/* ================= 位置环外部接口 =================
+ *
+ * 实现与分层在 app_motion.c (位置环 --P--> 速度给定 -> 速度环 --PI--> iq)。
+ * 这里只做三件事: 转发查询、转发目标设定、以及把"位置环已接管"通知给显示层。
+ * 数据来源都是快照或控制任务自己写的标量, 任意任务调用都安全。 */
+
+uint8_t app_motion_is_enabled(void)
+{
+#if APP_MOTION_ENABLE
+    return (s_motion.enable) ? 1U : 0U;
+#else
+    return 0U;
+#endif
+}
+
+uint8_t app_motion_is_running(void)
+{
+#if APP_MOTION_ENABLE
+    return s_motion_running;
+#else
+    return 0U;
+#endif
+}
+
+uint8_t app_motion_took_over(void)
+{
+#if APP_MOTION_ENABLE
+    uint8_t t = s_motion_takeover;
+
+    s_motion_takeover = 0U;        /* 读走即清 */
+    return t;
+#else
+    return 0U;
+#endif
+}
+
+float app_motion_get_speed_ref(void)
+{
+#if APP_MOTION_ENABLE
+    return s_motion.speed_ref;
+#else
+    return 0.0f;
+#endif
+}
+
+float app_motion_get_target_rad(void)
+{
+#if APP_MOTION_ENABLE
+    return s_motion.pos_ref;
+#else
+    return 0.0f;
+#endif
+}
+
+float app_motion_get_pos_rad(void)
+{
+#if APP_MOTION_ENABLE
+    return s_motion.pos_fb;
+#else
+    return 0.0f;
+#endif
+}
+
+float app_motion_get_err_rad(void)
+{
+#if APP_MOTION_ENABLE
+    return app_motion_get_err(&s_motion);
+#else
+    return 0.0f;
+#endif
+}
+
+void app_motion_set_target_rad(float pos_rad)
+{
+#if APP_MOTION_ENABLE
+    app_motion_set_target(&s_motion, pos_rad);
+#else
+    (void)pos_rad;
+#endif
 }
 
 /* ================= 主循环 ================= */
@@ -1246,6 +1410,10 @@ void app_run(void)
         /* 交给速度环 (内环)。速度环由 APP_FOC_SPEED_LOOP_ENABLE 打开 —— 
          * 位置环必须靠它提供阻尼, 见 app.h 的说明。 */
         app_speed_target_set(spd_ref);
+
+        /* 标记"本拍位置环接管了速度给定"。app_speed_apply() 会把状态拍成快照,
+         * 显示层据此显示位置环状态而不是把速度条的值当成用户设定。 */
+        s_motion_takeover = 1U;
     }
 #endif
 
@@ -1730,17 +1898,20 @@ void app_run(void)
             } else {
 #if APP_FOC_SPEED_LOOP_ENABLE
                 /* ---- a) 速度环 (目标 - 实测 -> iq) ----
-                 * 【目标值为什么要变号】编码器正方向与电机正方向的关系由
-                 * FOC_ENCODER_DIRECTION 决定 (当前 +1, 即"编码器读数增加 = 电机
-                 * 正转"), 而速度环的输出 iq 必须是【电机正方向】上的电流。
-                 * 若实测发现给定正转速时反而减速, 说明这台机器上两者相反,
-                 * 把 APP_FOC_SPEED_KP / KI 取负即可 (一行改动, 不要改这里)。
+                 * 【为什么目标要乘 s_speed_dir】速度环必须是负反馈: 给定"正转速"
+                 * 时实测转速也必须朝正走。而"实测 rpm 的符号"取决于编码器计数
+                 * 方向、相电流极性(自检结果为 ±1)、FOC 电角度约定这三件事的组合,
+                 * 任何一处反了, 速度环就成了【正反馈】(iq 顶到限幅、转子被反拖)。
+                 * s_speed_dir 就是这三件事合成后的符号, 由开机自检实测出来
+                 * (见 app_init 的"速度环方向自检"); 不想自检就用它的静态默认值。
+                 * 用 s_speed_dir 而不是改 Kp/Ki 的符号, 是因为 Kp/Ki 同时决定
+                 * 环路增益的"量", 取负会让人误以为增益也变了。
                  *
                  * 【积分限幅 = 抗饱和】积分项本身就等于稳态所需的 iq, 所以把它
                  * 夹在 ±IQ_LIMIT 内就够了。不夹的话, 目标远大于实际 (例如堵转)
                  * 时积分会一路涨到天上, 松开负载后要好几秒才退出来。 */
                 {
-                    float target = s_speed_target_rpm;
+                    float target = s_speed_target_rpm * s_speed_dir;
                     float e      = target - rpm;
                     float kp     = APP_FOC_SPEED_KP;
                     float ki     = APP_FOC_SPEED_KI;
