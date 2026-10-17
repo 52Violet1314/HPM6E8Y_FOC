@@ -294,13 +294,20 @@ void lcd_app_task_handler(void)
         s_stat_tick = 0U;
         LCD_GetTxStats(&st);
         LOG_I("LCD",
-              "5s: flush=%u pix=%u areamax=%u chunk=%u busy=%u tmo=%u fail=%u retry=%u abort=%u cmd=%u last=%u",
+              "5s: flush=%u pix=%u areamax=%u chunk=%u busy=%u tmo=%u fail=%u retry=%u abort=%u cmd=%u last=%u | "
+              "dma=%u%u dchunk=%u derr=%u dfb=%u dlast=%u",
               (unsigned)s_flush_count, (unsigned)s_flush_pixels,
               (unsigned)s_area_max_pixels,
               (unsigned)st.chunk_count, (unsigned)st.busy_count,
               (unsigned)st.timeout_count, (unsigned)st.fail_count,
               (unsigned)st.retry_count, (unsigned)st.band_abort_count,
-              (unsigned)st.byte_cmd_fail, (unsigned)st.last_status);
+              (unsigned)st.byte_cmd_fail, (unsigned)st.last_status,
+              /* dma=ready,disabled: 11 = 通路就绪且未被禁用(正常);
+               * dchunk 应该和 chunk 数量级一致(每块都走 DMA);
+               * derr/dfb 恒为 0 才说明 DMA 通路完全健康。 */
+              (unsigned)st.dma_ready, (unsigned)st.dma_disabled,
+              (unsigned)st.dma_chunk_count, (unsigned)st.dma_error_count,
+              (unsigned)st.dma_fallback_count, (unsigned)st.last_dma_status);
     }
 }
 

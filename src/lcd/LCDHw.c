@@ -3,6 +3,17 @@
 #include "hpm_gpio_drv.h"
 #include "board.h"
 
+/* ---- SPI1 TX DMA 需要的头 ---- */
+#include "hpm_dmav2_drv.h"      /* DMAV2(HDMA): dma_setup_handshake / 状态查询 */
+#include "hpm_dmamux_drv.h"     /* DMAMUX: 把外设请求线接到某个 DMA 通道      */
+#include "hpm_l1c_drv.h"        /* D-Cache 维护: 启动 DMA 前兜底 writeback    */
+#include "hpm_interrupt.h"      /* SDK_DECLARE_EXT_ISR_M / intc_m_enable_irq_* */
+/* RTOS: DMA 完成用信号量通知, 传输期间让出 CPU(见文件下半部分说明) */
+#include "FreeRTOS.h"
+#include "semphr.h"
+#include "task.h"
+#include "app_rtos.h"           /* APP_IRQ_PRIO_LCD_DMA */
+
 #include "LCDHw.h"
 #include "stdlib.h"
 
@@ -19,6 +30,10 @@
 #define LCDGPIO_LED  LCD_PAD_LED        /* 背光控制引脚    PC08 */
 #define LCDGPIO_RS   LCD_PAD_RS         /* 寄存器/数据选择 PC04 */
 #define LCDGPIO_RST  LCD_PAD_RST        /* 复位引脚        PC03 */
+
+/* SPI1 TX DMA 通路初始化: 实现放在下面的 DMA 段里, 而 LCD_SPIInit() 要调用它,
+ * 所以这里前置声明一下。 */
+static void lcd_dma_init(void);
 
  
 //GPIO置位（拉高）
@@ -146,6 +161,10 @@ int LCD_SPIInit(void)
     format_config.common_config.lsb = false;
     spi_format_init(LCD_SPI, &format_config);
 
+	/* SPI1 TX DMA 通路(全局唯一使用 HDMA 的地方)。放在这里是因为它必须在
+	 * 任何一次像素写之前就绪 —— LCD_Init() 末尾的 LCD_Clear() 就会用到。 */
+	lcd_dma_init();
+
 	return 0;
 }
 
@@ -192,12 +211,220 @@ void LCD_GetTxStats(lcd_tx_stats_t *out)
 	*out = s_lcd_stats;
 }
 
+/* ======================================================================
+ *  SPI1 像素通路: TX DMA(本分支的候选根治方案, 需上板验证)
+ *
+ * 【解决的是哪一件事】原来的 bulk 写(512B/块)是纯 CPU 轮询喂 TX FIFO:
+ *   while (transferred < count) { if (!(TXFULL)) ptr->DATA = 下一字节; }
+ *   TX FIFO 只有 8 字节深(SPI_SOC_FIFO_DEPTH), 33MHz 下只够 ~1.9us。
+ *   于是: (a) 显示任务(最低优先级)在整个刷屏期间占着 CPU 空转, 控制任务每 1ms
+ *   只能等它让出; (b) 一旦 CPU 被中断/任务抽走, FIFO 见底。
+ *   把"喂 FIFO"这件事交给 DMA 之后, 上面两条同时消失: 数据流由硬件保证,
+ *   显示任务在传输期间阻塞在信号量上, 控制任务的 1ms 节拍完全不受影响。
+ *
+ * 【注意】本改动并不能替代"实验 1"的结论: 如果实测 spi_transfer 的 busy/timeout
+ *   计数恒为 0(即一个字节都没丢), 那"长条"的根因就在 LVGL/窗口命令那一侧,
+ *   这个 DMA 分支就不是解药, 不要合。判定见 LCD_DISPLAY_FIX_REPORT.md 第 3 节。
+ *
+ * 【顺序严格照 hpm_spi_drv.h 的要求】先关 SPI 的 TX DMA 请求 -> 配 SPI 本次传输
+ *   -> 配好并启动 DMA 通道 -> 再打开请求(数据此时才开始流动) -> 等 TC -> 等 SPI 空闲。
+ *
+ * 【缓冲区】源缓冲必须放 noncacheable 段(与 ADC 抢占 DMA 同理, 见 bsp_adc.c):
+ *   DMA 不过 D-Cache, 若在可缓存段, CPU 刚写的字节可能还在 Cache 里。
+ *   这里用 ATTR_PLACE_AT_NONCACHEABLE_WITH_ALIGNMENT 放进 AXI_SRAM_NONCACHEABLE
+ *   (0x01280000 起, board_init_pmp() 已配成 non-cacheable), 启动前再 writeback 兜底。
+ *
+ * 【出错兜底】DMA 初始化失败或单块传输失败都会自动退回 CPU 轮询写; 连续失败
+ *   LCD_TX_DMA_FAIL_LIMIT 次则永久退回 —— 绝不会因为 DMA 没配好而黑屏。
+ * ====================================================================== */
+#define LCD_TX_DMA_ENABLE        (1U)   /* 置 0 = 直接使用 CPU 轮询写(代码仍编译) */
+#define LCD_TX_DMA               HPM_HDMA
+#define LCD_TX_DMAMUX            HPM_DMAMUX
+#define LCD_TX_DMA_CHANNEL       (0U)   /* 全工程没有别的模块使用 HDMA */
+#define LCD_TX_DMA_REQ_SRC       (HPM_DMA_SRC_SPI1_TX)
+/* 【不能带括号】SDK_DECLARE_EXT_ISR_M 里是 `irq_handler_wrapper_##irq_num`,
+ *   带括号的话会把 "_" 和 "(" 粘在一起 -> "pasting ... does not give a valid
+ *   preprocessing token"。必须是一个光秃秃的记号(和 bsp_adc.c 的写法一致)。 */
+#define LCD_TX_DMA_IRQ           IRQn_HDMA
+#define LCD_TX_DMA_MAX_BYTES     (512U) /* 保守上限: SPI_TRANSCTRL.WRTRANCNT 只有 9bit */
+#define LCD_TX_DMA_WAIT_MS       (50U)  /* 单块死等保护: 512B@25MHz 只要 ~165us */
+#define LCD_TX_DMA_FAIL_LIMIT    (8U)
+
+#define LCD_PIXEL_TRANSFER_BUFFER_SIZE (512U)
+#if (LCD_PIXEL_TRANSFER_BUFFER_SIZE > LCD_TX_DMA_MAX_BYTES)
+#error "pixel transfer buffer must not exceed LCD_TX_DMA_MAX_BYTES"
+#endif
+
+ATTR_PLACE_AT_NONCACHEABLE_WITH_ALIGNMENT(32)
+static u8 s_lcd_tx_buffer[LCD_PIXEL_TRANSFER_BUFFER_SIZE];
+
+static SemaphoreHandle_t s_lcd_dma_sem;
+static volatile u32 s_lcd_dma_status = DMA_CHANNEL_STATUS_ONGOING;
+static u8 s_lcd_dma_fail_streak;
+
+/* DMA 完成中断: 只"记状态 + 放信号量"(短 ISR)。
+ * dma_check_transfer_status() 是 W1C(读即清标志), 所以状态必须在这里存下来 ——
+ * 任务里再读一次只会读到 ONGOING。 */
+SDK_DECLARE_EXT_ISR_M(LCD_TX_DMA_IRQ, lcd_hw_dma_isr)
+void lcd_hw_dma_isr(void)
+{
+    BaseType_t woken = pdFALSE;
+    u32 st = dma_check_transfer_status(LCD_TX_DMA, LCD_TX_DMA_CHANNEL);
+
+    if (st != DMA_CHANNEL_STATUS_ONGOING) {
+        s_lcd_dma_status = st;
+        if (s_lcd_dma_sem != NULL) {
+            (void)xSemaphoreGiveFromISR(s_lcd_dma_sem, &woken);
+        }
+    }
+    portYIELD_FROM_ISR(woken);
+}
+
+/* DMA 通路初始化(调度器启动前由 LCD_SPIInit() 调用) */
+static void lcd_dma_init(void)
+{
+    if (s_lcd_stats.dma_disabled != 0U) {
+        return;
+    }
+
+    clock_add_to_group(clock_hdma, 0);      /* board_init_clock() 已加过, 幂等 */
+    s_lcd_dma_sem = xSemaphoreCreateBinary();
+    if (s_lcd_dma_sem == NULL) {
+        s_lcd_stats.dma_disabled = 1U;      /* 堆不够: 老老实实轮询写 */
+        return;
+    }
+
+    /* DMAMUX: HDMA 通道 n 的请求源 = DMAMUX 通道 n(DMAMUX_MUXCFG_HDMA_MUX0 == 0) */
+    dmamux_config(LCD_TX_DMAMUX, LCD_TX_DMA_CHANNEL, LCD_TX_DMA_REQ_SRC, true);
+
+    /* 优先级必须 >= configMAX_SYSCALL_INTERRUPT_PRIORITY(=4), 因为 ISR 里要放
+     * FreeRTOS 信号量; 取 6 比 USB(5) 低, 见 app_rtos.h 的中断优先级表。 */
+    intc_m_enable_irq_with_priority(LCD_TX_DMA_IRQ, APP_IRQ_PRIO_LCD_DMA);
+
+    s_lcd_stats.dma_ready = 1U;
+}
+
+/* 等一次 DMA 传输结束。status_success = 本次搬完。 */
+static hpm_stat_t lcd_dma_wait(void)
+{
+    u32 st;
+
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        /* 关键: 阻塞让出 CPU。刷屏期间控制任务照常拿 1ms 节拍。 */
+        if (xSemaphoreTake(s_lcd_dma_sem, pdMS_TO_TICKS(LCD_TX_DMA_WAIT_MS)) != pdTRUE) {
+            (void)dma_check_transfer_status(LCD_TX_DMA, LCD_TX_DMA_CHANNEL);
+            dma_disable_channel(LCD_TX_DMA, LCD_TX_DMA_CHANNEL);
+            s_lcd_stats.dma_error_count++;
+            return status_timeout;
+        }
+        st = s_lcd_dma_status;
+    } else {
+        /* 上电初始化阶段(还没起调度器): 不能调 xSemaphoreTake, 自旋等中断 */
+        u32 guard = 0U;
+
+        do {
+            st = s_lcd_dma_status;
+            if (st != DMA_CHANNEL_STATUS_ONGOING) {
+                break;
+            }
+            guard++;
+        } while (guard < 2000000U);
+
+        if (st == DMA_CHANNEL_STATUS_ONGOING) {
+            st = dma_check_transfer_status(LCD_TX_DMA, LCD_TX_DMA_CHANNEL);
+            if (st == DMA_CHANNEL_STATUS_ONGOING) {
+                dma_disable_channel(LCD_TX_DMA, LCD_TX_DMA_CHANNEL);
+                s_lcd_stats.dma_error_count++;
+                return status_timeout;
+            }
+        }
+    }
+
+    s_lcd_stats.last_dma_status = st;
+    if ((st & (DMA_CHANNEL_STATUS_ERROR | DMA_CHANNEL_STATUS_ABORT)) != 0U) {
+        s_lcd_stats.dma_error_count++;
+        return status_fail;
+    }
+    if ((st & DMA_CHANNEL_STATUS_TC) == 0U) {
+        s_lcd_stats.dma_error_count++;
+        return status_timeout;
+    }
+
+    s_lcd_stats.dma_chunk_count++;
+    return status_success;
+}
+
+/* 用 DMA 把 len 字节写到 SPI1(CS/RS 由调用者管) */
+static hpm_stat_t lcd_dma_write_block(const u8 *buff, u32 len)
+{
+    spi_control_config_t cfg;
+    dma_handshake_config_t hs;
+    hpm_stat_t stat;
+
+    /* 1) 上一块必须彻底移出, 否则 spi_setup_dma_transfer 会直接回 busy */
+    if (spi_wait_for_idle_status(LCD_SPI) != status_success) {
+        s_lcd_stats.dma_error_count++;
+        return status_timeout;
+    }
+    spi_disable_tx_dma(LCD_SPI);
+
+    /* 2) 配 SPI(软复位 + 方向/长度 + CMD/ADDR 相位), 但先不开 DMA 请求 */
+    spi_master_get_default_control_config(&cfg);
+    cfg.common_config.trans_mode = spi_trans_write_only;
+    cfg.common_config.data_phase_fmt = spi_single_io_mode;
+    cfg.common_config.tx_dma_enable = false;
+    cfg.common_config.rx_dma_enable = false;
+    if (spi_setup_dma_transfer(LCD_SPI, &cfg, NULL, NULL, len, 0U) != status_success) {
+        s_lcd_stats.dma_error_count++;
+        return status_fail;
+    }
+
+    /* 3) 兜底 cache 维护(缓冲区已在 noncacheable 段, 这里是双保险) */
+    if (l1c_dc_is_enabled()) {
+        l1c_dc_writeback((u32)buff, len);
+    }
+
+    /* 4) 配好并启动 DMA 通道(此刻 SPI 还没发请求, 不会丢数据)。
+     *    dst_fixed = true 同时意味着 dst_mode = HANDSHAKE: 由 SPI 的 TX 请求
+     *    节拍推动, 每个请求搬 1 字节, FIFO 满就自动停。 */
+    s_lcd_dma_status = DMA_CHANNEL_STATUS_ONGOING;
+    dma_default_handshake_config(LCD_TX_DMA, &hs);
+    hs.src = core_local_mem_to_sys_address(BOARD_RUNNING_CORE, (u32)buff);
+    hs.dst = core_local_mem_to_sys_address(BOARD_RUNNING_CORE, (u32)&LCD_SPI->DATA);
+    hs.size_in_byte = len;
+    hs.data_width = DMA_TRANSFER_WIDTH_BYTE;
+    hs.ch_index = (u8)LCD_TX_DMA_CHANNEL;
+    hs.src_fixed = false;
+    hs.dst_fixed = true;
+    hs.en_infiniteloop = false;
+    hs.interrupt_mask = DMA_INTERRUPT_MASK_HALF_TC;  /* 只屏蔽半传输中断; TC/ERR/ABORT 使能 */
+    stat = dma_setup_handshake(LCD_TX_DMA, &hs, true);
+    if (stat != status_success) {
+        s_lcd_stats.dma_error_count++;
+        return stat;
+    }
+
+    /* 5) 清掉可能残留的通知, 再打开 SPI 的 TX DMA 请求: 数据从这一刻开始流动 */
+    (void)xSemaphoreTake(s_lcd_dma_sem, 0);
+    spi_enable_tx_dma(LCD_SPI);
+
+    stat = lcd_dma_wait();
+
+    /* 6) 关请求并等最后一个字节移出, 保证调用者可以安全抬 CS */
+    spi_disable_tx_dma(LCD_SPI);
+    if (spi_wait_for_idle_status(LCD_SPI) != status_success) {
+        s_lcd_stats.dma_error_count++;
+        return status_timeout;
+    }
+
+    return stat;
+}
+
 u8 SPI_WriteByte(u8 data)
 {
 	u8 recivedata = 0U;
 	spi_control_config_t control_config;
 	hpm_stat_t stat;
-
 	spi_master_get_default_control_config(&control_config);
 	control_config.common_config.trans_mode = spi_trans_write_read_together;
 	control_config.common_config.data_phase_fmt = spi_single_io_mode;
@@ -215,7 +442,8 @@ u8 SPI_WriteByte(u8 data)
 	return recivedata;
 }
 
-u8 SPI_WriteBlock(u8 *data,u32 len)
+/* 原来的纯 CPU 轮询写法(出错时的退路, 语义与原实现一致) */
+static u8 lcd_spi_write_block_poll(u8 *data,u32 len)
 {
 	u32 transfer_size;
 
@@ -244,6 +472,29 @@ u8 SPI_WriteBlock(u8 *data,u32 len)
 	}
 
 	return 0U;
+}
+
+/* 块写入口: DMA 可用走 DMA, 否则/出错退回轮询。
+ * 两条路径写出的字节序列完全相同(都是按顺序写 SPI1->DATA), 所以退回轮询
+ * 不会引入额外的画面差异。 */
+u8 SPI_WriteBlock(u8 *data,u32 len)
+{
+	if ((s_lcd_stats.dma_ready != 0U) && (s_lcd_stats.dma_disabled == 0U) && (len > 0U)) {
+		if (lcd_dma_write_block(data, len) == status_success) {
+			s_lcd_dma_fail_streak = 0U;
+			return 0U;
+		}
+		/* 单次失败: 记一次, 连续失败到上限就永久退回轮询, 不让屏幕卡死 */
+		s_lcd_stats.dma_fallback_count++;
+		if (s_lcd_dma_fail_streak < 0xFFU) {
+			s_lcd_dma_fail_streak++;
+		}
+		if (s_lcd_dma_fail_streak >= LCD_TX_DMA_FAIL_LIMIT) {
+			s_lcd_stats.dma_disabled = 1U;
+		}
+	}
+
+	return lcd_spi_write_block_poll(data, len);
 }
 	   
 //管理LCD重要参数
@@ -335,12 +586,10 @@ void Lcd_WriteData_Block(u8 *data,u32 len)
 	LCD_CS_SET;
 }
 
-#define LCD_PIXEL_TRANSFER_BUFFER_SIZE (512U)
 #define LCD_WRITE_RETRY_MAX            (2U)
 
 void LCD_WritePixels(const u8 *data, u32 pixel_count)
 {
-	static u8 transfer_buffer[LCD_PIXEL_TRANSFER_BUFFER_SIZE];
 	u32 chunk_pixels;
 	u32 i;
 	u32 retry;
@@ -354,10 +603,12 @@ void LCD_WritePixels(const u8 *data, u32 pixel_count)
 			chunk_pixels = LCD_PIXEL_TRANSFER_BUFFER_SIZE / 2U;
 		}
 
-		/* Match the master_lcd RGB565 wire format: byte-swapped and inverted. */
+		/* Match the master_lcd RGB565 wire format: byte-swapped and inverted.
+		 * 【注意】这里用的是 s_lcd_tx_buffer(放在 AXI_SRAM_NONCACHEABLE 段),
+		 * 不是普通的局部 static —— 它会被 DMA 直接读, 不能留在可缓存段。 */
 		for (i = 0U; i < chunk_pixels; i++) {
-			transfer_buffer[i * 2U] = (u8)~data[i * 2U + 1U];
-			transfer_buffer[i * 2U + 1U] = (u8)~data[i * 2U];
+			s_lcd_tx_buffer[i * 2U] = (u8)~data[i * 2U + 1U];
+			s_lcd_tx_buffer[i * 2U + 1U] = (u8)~data[i * 2U];
 		}
 
 		/* 【失败为什么改成"重发"而不是 break】
@@ -370,7 +621,7 @@ void LCD_WritePixels(const u8 *data, u32 pixel_count)
 		 * 【注意】这一步只是"不静默丢数据", 不是对根因下结论: 根因看
 		 * LCD_GetTxStats() 的 busy/timeout 计数。 */
 		retry = 0U;
-		while (SPI_WriteBlock(transfer_buffer, chunk_pixels * 2U) != 0U) {
+		while (SPI_WriteBlock(s_lcd_tx_buffer, chunk_pixels * 2U) != 0U) {
 			if (retry >= LCD_WRITE_RETRY_MAX) {
 				s_lcd_stats.band_abort_count++;
 				break;

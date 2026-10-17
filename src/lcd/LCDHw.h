@@ -74,6 +74,14 @@ typedef struct {
     u32 retry_count;       /* 因失败重发同一块的次数 */
     u32 band_abort_count;  /* 重发仍失败、放弃本条 band 剩余像素的次数 */
     u32 last_status;       /* 最近一次 spi_transfer 的返回值(hpm_stat_t) */
+
+    /* ---- SPI1 TX DMA 通路(见 LCDHw.c 顶部说明) ---- */
+    u32 dma_chunk_count;   /* 由 DMA 搬完的块数 */
+    u32 dma_error_count;   /* DMA 失败/超时的次数 */
+    u32 dma_fallback_count;/* 因 DMA 失败而回退到 CPU 轮询写的次数 */
+    u32 last_dma_status;   /* 最近一次 DMA 通道状态(hpm_dmav2_drv.h) */
+    u8  dma_ready;         /* 1 = DMA 通路初始化成功 */
+    u8  dma_disabled;      /* 1 = 已永久退回 CPU 轮询(连续失败达上限/初始化失败) */
 } lcd_tx_stats_t;
 
 void LCD_GetTxStats(lcd_tx_stats_t *out);

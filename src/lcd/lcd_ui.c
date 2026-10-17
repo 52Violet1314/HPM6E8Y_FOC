@@ -156,13 +156,18 @@ void lcd_ui_create(void)
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
-    /* ---- 标题 ---- */
-    title = ui_label(screen, "电机转速", &lv_font_montserrat_20, UI_TEXT);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 6);
+    /* ---- 标题 ----
+     * 【全部界面文本必须是 ASCII】LVGL 只编译了 Montserrat, 它没有中文字形
+     * (lv_conf.h 里 LV_FONT_SOURCE_HAN_SANS_SC_*_CJK 都是 0)。写中文进去在屏上
+     * 就是空框/缺字 —— 这正是之前"转速那一块画面不规则"的一部分原因, 不是排版
+     * 问题。所以要中文界面必须先把 CJK 字体编进去(阈值 LV_MEM_SIZE 也得跟着涨),
+     * 在那之前这里只用英文+数字。 */
+    title = ui_label(screen, "SPEED", &lv_font_montserrat_20, UI_TEXT);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 8);
     {
-        lv_obj_t *en = ui_label(screen, "MOTOR SPEED", &lv_font_montserrat_12, UI_DIM);
+        lv_obj_t *en = ui_label(screen, "MOTOR", &lv_font_montserrat_12, UI_DIM);
 
-        lv_obj_align(en, LV_ALIGN_TOP_RIGHT, -10, 12);
+        lv_obj_align(en, LV_ALIGN_TOP_RIGHT, -10, 13);
     }
 
     /* ---- 大字转速 ---- */
@@ -170,22 +175,23 @@ void lcd_ui_create(void)
     lv_obj_align(s_ui.lbl_rpm, LV_ALIGN_TOP_LEFT, 12, 30);
 
     s_ui.lbl_unit = ui_label(screen, "RPM", &lv_font_montserrat_20, UI_DIM);
-    lv_obj_align(s_ui.lbl_unit, LV_ALIGN_TOP_LEFT, 150, 48);
+    lv_obj_align(s_ui.lbl_unit, LV_ALIGN_TOP_LEFT, 150, 50);
 
-    /* 大字高度约 48px, 底边约在 y=78 */
-
-    /* ---- 速度条 (目标转速) ---- */
-    lbl_cap = ui_label(screen, "目标转速", &lv_font_montserrat_14, UI_TEXT);
-    lv_obj_align(lbl_cap, LV_ALIGN_TOP_LEFT, 10, 84);
+    /* ---- 速度条 (目标转速) ----
+     * 【纵向排布的依据】滑条本体占 y 106..132, 但 knob 设成 34px 高,
+     * 会从 y=102 突出到 y=140 —— 所以刻度 0/600 必须放到 144 以下,
+     * 否则旋钮压到数字上(之前就是这个问题)。 */
+    lbl_cap = ui_label(screen, "TARGET", &lv_font_montserrat_14, UI_TEXT);
+    lv_obj_align(lbl_cap, LV_ALIGN_TOP_LEFT, 10, 86);
 
     s_ui.lbl_target = ui_label(screen, "--- RPM", &lv_font_montserrat_16, UI_ACCENT);
-    lv_obj_align(s_ui.lbl_target, LV_ALIGN_TOP_RIGHT, -10, 82);
+    lv_obj_align(s_ui.lbl_target, LV_ALIGN_TOP_RIGHT, -10, 84);
 
     lbl_min = ui_label(screen, "0", &lv_font_montserrat_12, UI_DIM);
-    lv_obj_align(lbl_min, LV_ALIGN_TOP_LEFT, 10, 134);
+    lv_obj_align(lbl_min, LV_ALIGN_TOP_LEFT, 10, 146);
 
     lbl_max = ui_label(screen, "600", &lv_font_montserrat_12, UI_DIM);
-    lv_obj_align(lbl_max, LV_ALIGN_TOP_RIGHT, -10, 134);
+    lv_obj_align(lbl_max, LV_ALIGN_TOP_RIGHT, -10, 146);
 
     s_ui.slider = lv_slider_create(screen);
     lv_obj_set_size(s_ui.slider, 268, 26);
@@ -205,19 +211,19 @@ void lcd_ui_create(void)
     lv_obj_add_event_cb(s_ui.slider, slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* ---- 反馈行 ---- */
-    s_ui.lbl_fb = ui_label(screen, "初始化...", &lv_font_montserrat_14, UI_DIM);
-    lv_obj_align(s_ui.lbl_fb, LV_ALIGN_TOP_LEFT, 10, 150);
+    s_ui.lbl_fb = ui_label(screen, "INIT...", &lv_font_montserrat_14, UI_DIM);
+    lv_obj_align(s_ui.lbl_fb, LV_ALIGN_TOP_LEFT, 10, 164);
 
     s_ui.lbl_readback = ui_label(screen, "", &lv_font_montserrat_12, UI_WARN);
-    lv_obj_align(s_ui.lbl_readback, LV_ALIGN_TOP_LEFT, 10, 172);
+    lv_obj_align(s_ui.lbl_readback, LV_ALIGN_TOP_LEFT, 10, 182);
 
     {
         lv_obj_t *hint = ui_label(screen,
-            "拖动速度条设定目标转速\n"
-            "控制任务按 1kHz 下发",
+            "SLIDE = SET TARGET\n"
+            "APPLIED AT 1kHz",
             &lv_font_montserrat_12, UI_DIM);
 
-        lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 10, -8);
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 10, -6);
     }
 }
 
@@ -292,25 +298,25 @@ void lcd_ui_refresh(float rpm, float target, float target_eff,
 
     /* ---- 状态行 ---- */
     if (busy != 0U) {
-        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "校准中 (目标不生效)");
+        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "CALIBRATING");
         lv_obj_set_style_text_color(s_ui.lbl_fb, lv_color_hex(UI_WARN), 0);
         ui_text(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback),
-                "等标定结束后再调速");
+                "TARGET IGNORED");
     } else if (running == 0U) {
-        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "电机未使能");
+        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "MOTOR OFF");
         lv_obj_set_style_text_color(s_ui.lbl_fb, lv_color_hex(UI_BAD), 0);
         ui_text(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback), "");
     } else {
 #if APP_FOC_CLOSED_LOOP_ENABLE
-        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "FOC 电流环 运行中");
+        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "FOC RUNNING");
 #else
-        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "开环电压矢量 运行中");
+        ui_text(s_ui.lbl_fb, s_ui.fb, sizeof(s_ui.fb), "OPENLOOP RUN");
 #endif
         lv_obj_set_style_text_color(s_ui.lbl_fb, lv_color_hex(UI_OK), 0);
 
 #if APP_FOC_SPEED_LOOP_ENABLE
         ui_text(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback),
-                "速度环已接管 iq");
+                "SPEED LOOP OWNS IQ");
 #else
         /* 没有速度环时, 目标转速只作为软限速/开环频率给定 —— 老实告诉用户,
          * 免得看到"实际转速不等于目标"以为是 bug。 */
@@ -319,19 +325,19 @@ void lcd_ui_refresh(float rpm, float target, float target_eff,
         if ((pending != 0U) || (eff_i != tgt_i)) {
             /* 目标刚被拖过 / 斜坡还没爬到: 用"当前值 -> 目标值"显示出来 */
             ui_text_fmt(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback),
-                        "斜坡中 %d -> %d RPM", eff_i, tgt_i);
+                        "RAMP %d > %d RPM", eff_i, tgt_i);
         } else if (tgt_i >= LCD_UI_RPM_MAX) {
             /* 拉到底 = 不额外限速 (软限速上限仍是 app 里的 APP_FOC_RPM_LIMIT)。
              * 这是刻意的: 600 RPM 低于默认限速 1000 RPM, 若照字面限到 600,
              * 用户一拖到底反而把转速上限压低了。 */
             ui_text(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback),
-                    "速度条拉满 = 不额外限速");
+                    "FULL = NO EXTRA LIMIT");
         } else if (tgt_i == 0) {
             ui_text(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback),
-                    "0 = 不限速 (低端并到满量程)");
+                    "0 = NO LIMIT");
         } else {
             ui_text_fmt(s_ui.lbl_readback, s_ui.readback, sizeof(s_ui.readback),
-                        "软限速 %d RPM (未闭环调速)", tgt_i, -1);
+                        "LIMIT %d RPM", tgt_i, -1);
         }
 #endif
     }

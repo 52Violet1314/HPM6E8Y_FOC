@@ -16,10 +16,14 @@
  *     - 优先级 >=4 的中断可以被屏蔽, 也【必须】这样 —— 因为只有它会在中断里
  *       调用 RTOS API (CherryUSB 的 osal 会 give semaphore), 否则内核数据结构
  *       在关中断期间被改坏, 表现为偶发死机。
- * 现状: 电流环=1 (绝对实时), 串口TX=3 (不调 RTOS API), USB=5 (调 RTOS API)。 */
+ * 现状: 电流环=1 (绝对实时), 串口TX=3 (不调 RTOS API), USB=5 (调 RTOS API),
+ *       LCD 像素 DMA 完成=6 (调 RTOS API: 给信号量唤醒显示任务)。
+ *       LCD DMA 取 6 而不是 5: 它只是"通知一块像素搬完了", 时限不如 USB 的 SOF 紧;
+ *       但同样必须 >= 4, 因为它要在中断里 give 一个 FreeRTOS 信号量。 */
 #define APP_IRQ_PRIO_CURRENT    (1U)
 #define APP_IRQ_PRIO_CONSOLE    (3U)
 #define APP_IRQ_PRIO_USB        (5U)
+#define APP_IRQ_PRIO_LCD_DMA    (6U)
 
 /* ---------------- 任务优先级 (数值越大越高) ---------------- */
 #define APP_TASK_PRIO_CONTROL   (configMAX_PRIORITIES - 1)   /* 控制: 最高 */
