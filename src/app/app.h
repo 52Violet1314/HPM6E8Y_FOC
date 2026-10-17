@@ -341,9 +341,20 @@ extern "C" {
  *   大角度快速定位可以加到 100~150, 但先确认机械行程有余量。 */
 #define APP_MOTION_SPEED_LIMIT_RPM  (60.0f)
 
-/* 上电自动演示: 先原地保持, 之后每 3 秒在 ±90° 之间来回, 直接看位置环效果。
- * 想自己给目标就置 0, 然后调 app_motion_set_target(&s_motion, rad)。 */
-#define APP_MOTION_DEMO_ENABLE      (1)
+/* 上电自动演示: 每 APP_MOTION_DEMO_PERIOD_MS 在"基准角"与"基准角+90°"之间来回。
+ *
+ *   1 = 演示模式: 上电后电机自己每 3 秒走 90°(调位置环增益/看超调时用)
+ *   0 = 【默认】上电待命: 位置环已使能, 但目标就是"上电那一刻的位置",
+ *       所以电流环/位置环/速度环都在跑, 电机【锁在原地不动】, 直到按键
+ *       (Key2/Key3, 见 bsp_button.c)给它新的目标位置。
+ *
+ * 【为什么默认改成 0】上电就让电机自己动, 在台架上很容易打手/撞限位;
+ * 而且"上电自己开起来"这件事会让"到底谁在控制"变得说不清。现在上电是
+ * 静止待命 --- 电机是"锁住"的(不是断电自由态), 按一下才走一步。
+ * 这是 APP_MOTION_DEMO_ENABLE = 0 + APP_MOTION_ENABLE = 1 的组合效果:
+ *   电流环使能 -> 有保持转矩;  位置环目标=当前 -> 速度给定=0 -> 原地保持。
+ * 想要上电彻底不出力(可自由转动), 再把 APP_MOTION_ENABLE 也置 0。 */
+#define APP_MOTION_DEMO_ENABLE      (0)
 #define APP_MOTION_DEMO_PERIOD_MS   (3000U)
 #define APP_MOTION_DEMO_STEP_RAD    (1.5707963f)   /* 90° */
 /* 过流硬保护阈值 (A): 一旦超过立刻封锁输出并锁死 (需复位)。
