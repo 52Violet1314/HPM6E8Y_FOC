@@ -2,7 +2,28 @@
  * Copyright (c) 2026
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * BSP: J11 按键输入实现 (消抖 + 长按连发)
+ * BSP: 按键输入实现 (板上实体键 + J11 外接键, 消抖 + 长按连发)
+ *
+ * 【本板实际接线 —— 已按原理图核对, 不是猜的】
+ *   原理图 page 8 上三个实体键, 每个都是
+ *       +3V3 -- 10K 上拉 --+-- KEYx --→ MCU 引脚
+ *                          |
+ *                       100nF 对地
+ *       按键 SWx 一端接 KEYx, 另一端接 GND          (低有效)
+ *   对应关系(用 PDF 渲染成图逐条核对的):
+ *       SW4 (Key1) -> KEYA -> PC14   R165 10K / C136 100nF
+ *       SW5 (Key2) -> KEYB -> PC15   R170 10K / C137 100nF
+ *       SW6 (Key3) -> KEYC -> PC19   R115 10K / C148 100nF
+ *
+ * 【为什么用 PC15/PC19 而不是 J11 外接】
+ *   Key1(SW4/PC14) 在本板已损坏; Key2/Key3 完好, 而且板上已有 10K 上拉 +
+ *   100nF 硬件滤波, 比外接更省事。这两个脚在本工程里没有被任何外设占用
+ *   (见 bsp_button.h 的核查清单), 可以安全当 GPIO 输入。
+ *
+ * 【上拉怎么配】板上已经有 10K 外部上拉, 所以这里【不再开内部上拉】:
+ *   内部上拉和外部上拉并联只会让"松开"更硬一点, 没坏处, 但按下时
+ *   按键要把两者一起拉低, 没必要多花电流。J11 外接按键(没有外部上拉)
+ *   则必须开内部上拉 —— 所以每个按键单独配。
  */
 #include "board.h"
 #include "hpm_gpio_drv.h"
@@ -13,34 +34,41 @@
 #include "app.h"            /* APP_MAIN_LOOP_MS: 采样周期 (ms) */
 #include "bsp_button.h"
 
-/* ---- 脚位 (改脚只改这三组) ----
- * 注意 HPM 的 GPIO 驱动签名是 gpio_read_pin(base, port_index, pin):
- *   port_index 用 GPIO_DI_GPIOx (见 hpm_gpio_regs.h), pin 是组内位号。 */
 #define BSP_BTN_GPIO        HPM_GPIO0
-#define BSP_BTN_PORT_UP     GPIO_DI_GPIOD   /* PD8  */
-#define BSP_BTN_PORT_DOWN   GPIO_DI_GPIOC   /* PC25 */
-#define BSP_BTN_PORT_HOME   GPIO_DI_GPIOD   /* PD16 */
-
-#define BSP_BTN_PIN_UP      (8U)
-#define BSP_BTN_PIN_DOWN    (25U)
-#define BSP_BTN_PIN_HOME    (16U)
-
-#define BSP_BTN_PAD_UP      IOC_PAD_PD08
-#define BSP_BTN_PAD_DOWN    IOC_PAD_PC25
-#define BSP_BTN_PAD_HOME    IOC_PAD_PD16
-
-#define BSP_BTN_FUNC_UP     IOC_PD08_FUNC_CTL_GPIO_D_08
-#define BSP_BTN_FUNC_DOWN   IOC_PC25_FUNC_CTL_GPIO_C_25
-#define BSP_BTN_FUNC_HOME   IOC_PD16_FUNC_CTL_GPIO_D_16
 
 /* ---- 消抖 / 连发参数 (单位: 控制周期数, = ms) ---- */
 #define BSP_BTN_DEBOUNCE_MS (20U)   /* 连续稳定的时间才算一次真实变化 */
 #define BSP_BTN_LONG_MS     (600U)  /* 按住多久开始连发 */
 #define BSP_BTN_REPEAT_MS   (150U)  /* 连发间隔 */
 
+/* 一个按键的静态配置 */
 typedef struct {
-    uint32_t port;              /* GPIO_DI_GPIOx */
-    uint8_t  pin;               /* 组内位号 */
+    uint32_t port;          /* GPIO_DI_GPIOx */
+    uint8_t  pin;           /* 组内位号 */
+    uint32_t pad;           /* IOC_PAD_xxx */
+    uint32_t func;          /* IOC_Pxx_FUNC_CTL_GPIO_x_xx */
+    uint8_t  pull_up;       /* 1 = 开内部上拉(外接键); 0 = 板上已有外部上拉 */
+    const char *name;       /* 日志/自检用 */
+} btn_cfg_t;
+
+/* ---- 按键映射: 改脚位/改功能只改这张表 ----
+ *
+ *   UP   = 板上 Key2 (SW5 / KEYB / PC15)  -> 位置 + (每步 5°, 长按连发)
+ *   DOWN = 板上 Key3 (SW6 / KEYC / PC19)  -> 位置 -
+ *   HOME = J11 PD8 (脚 42, 外接)          -> 回起点(重新定零)
+ *
+ * 【HOME 为什么留在 J11】板上三个键里 Key1 已坏, 只剩两个可用; 把两个好键留给
+ * 调速(最常用), "回起点"这种低频操作留给 J11 外接的一个微动开关。
+ * 如果你不想接第三个键, 把 HOME 那行的 pad/func/pin 改成和 UP/DOWN 一样的
+ * GPIO 也行 —— 代价是那个功能一直不触发, 不影响其他两个键。 */
+static const btn_cfg_t s_cfg[BSP_BTN_COUNT] = {
+    /* port                          pin                    pad                func                              pull name   */
+    { GPIO_DI_GPIOC,                 15U, IOC_PAD_PC15, IOC_PC15_FUNC_CTL_GPIO_C_15, 0U, "Key2/PC15" },
+    { GPIO_DI_GPIOC,                 19U, IOC_PAD_PC19, IOC_PC19_FUNC_CTL_GPIO_C_19, 0U, "Key3/PC19" },
+    { GPIO_DI_GPIOD,                  8U, IOC_PAD_PD08, IOC_PD08_FUNC_CTL_GPIO_D_08, 1U, "J11/PD8"   },
+};
+
+typedef struct {
     uint8_t  stable;            /* 消抖后的状态: 1 = 按下 */
     uint8_t  last_raw;          /* 上一次原始采样 */
     uint16_t cnt;               /* 当前原始状态已经持续的拍数 */
@@ -50,31 +78,17 @@ typedef struct {
 
 static btn_state_t s_btn[BSP_BTN_COUNT];
 
-static void btn_pad_init(uint32_t pad, uint32_t func)
-{
-    /* 上拉 + 施密特: 按键一端接引脚、另一端接 GND, 松开时必须被稳稳拉到高电平。
-     * 不加上拉的话浮空脚会被旁边的 PWM/SPI 噪声耦合出假按键。 */
-    HPM_IOC->PAD[pad].FUNC_CTL = func;
-    HPM_IOC->PAD[pad].PAD_CTL  = IOC_PAD_PAD_CTL_PE_SET(1)   /* 上拉使能 */
-                               | IOC_PAD_PAD_CTL_PS_SET(1)   /* 上拉(非下拉) */
-                               | IOC_PAD_PAD_CTL_HYS_SET(1); /* 施密特 */
-}
-
 void bsp_button_init(void)
 {
-    btn_pad_init(BSP_BTN_PAD_UP,   BSP_BTN_FUNC_UP);
-    btn_pad_init(BSP_BTN_PAD_DOWN, BSP_BTN_FUNC_DOWN);
-    btn_pad_init(BSP_BTN_PAD_HOME, BSP_BTN_FUNC_HOME);
-
-    s_btn[BSP_BTN_UP].port   = BSP_BTN_PORT_UP;
-    s_btn[BSP_BTN_UP].pin    = BSP_BTN_PIN_UP;
-    s_btn[BSP_BTN_DOWN].port = BSP_BTN_PORT_DOWN;
-    s_btn[BSP_BTN_DOWN].pin  = BSP_BTN_PIN_DOWN;
-    s_btn[BSP_BTN_HOME].port = BSP_BTN_PORT_HOME;
-    s_btn[BSP_BTN_HOME].pin  = BSP_BTN_PIN_HOME;
-
     for (uint32_t i = 0U; i < (uint32_t)BSP_BTN_COUNT; i++) {
-        (void)gpio_set_pin_input(BSP_BTN_GPIO, s_btn[i].port, s_btn[i].pin);
+        /* 复用成 GPIO + 施密特(抗噪); 上拉按表决定 */
+        HPM_IOC->PAD[s_cfg[i].pad].FUNC_CTL = s_cfg[i].func;
+        HPM_IOC->PAD[s_cfg[i].pad].PAD_CTL  = IOC_PAD_PAD_CTL_HYS_SET(1)
+                                            | ((s_cfg[i].pull_up != 0U)
+                                               ? (IOC_PAD_PAD_CTL_PE_SET(1) | IOC_PAD_PAD_CTL_PS_SET(1))
+                                               : 0U);
+
+        (void)gpio_set_pin_input(BSP_BTN_GPIO, s_cfg[i].port, s_cfg[i].pin);
         s_btn[i].stable    = 0U;
         s_btn[i].last_raw  = 0U;
         s_btn[i].cnt       = 0U;
@@ -86,7 +100,7 @@ void bsp_button_init(void)
 uint8_t bsp_button_raw_level(bsp_btn_id_t which)
 {
     /* 低有效: 按下读到 0 -> 返回 1 */
-    return (gpio_read_pin(BSP_BTN_GPIO, s_btn[which].port, s_btn[which].pin) == 0U)
+    return (gpio_read_pin(BSP_BTN_GPIO, s_cfg[which].port, s_cfg[which].pin) == 0U)
            ? 1U : 0U;
 }
 
@@ -95,9 +109,14 @@ uint8_t bsp_button_is_down(bsp_btn_id_t which)
     return s_btn[which].stable;
 }
 
-static uint8_t btn_update(btn_state_t *b)
+const char *bsp_button_name(bsp_btn_id_t which)
 {
-    uint8_t raw = (gpio_read_pin(BSP_BTN_GPIO, b->port, b->pin) == 0U) ? 1U : 0U;   /* 低有效 */
+    return s_cfg[which].name;
+}
+
+static uint8_t btn_update(btn_state_t *b, const btn_cfg_t *c)
+{
+    uint8_t raw = (gpio_read_pin(BSP_BTN_GPIO, c->port, c->pin) == 0U) ? 1U : 0U;   /* 低有效 */
     uint8_t ev  = BSP_BTN_EV_NONE;
 
     if (raw != b->last_raw) {
@@ -110,8 +129,8 @@ static uint8_t btn_update(btn_state_t *b)
     if ((b->cnt >= BSP_BTN_DEBOUNCE_MS) && (b->stable != raw)) {
         b->stable = raw;                /* 认定一次真实的状态变化 */
         if (raw != 0U) {
-            ev          = BSP_BTN_EV_DOWN;
-            b->hold_ms  = 0U;
+            ev           = BSP_BTN_EV_DOWN;
+            b->hold_ms   = 0U;
             b->repeat_ms = 0U;
         } else {
             ev = BSP_BTN_EV_UP;
@@ -141,7 +160,7 @@ uint8_t bsp_button_poll(bsp_btn_id_t which)
     if ((uint32_t)which >= (uint32_t)BSP_BTN_COUNT) {
         return BSP_BTN_EV_NONE;
     }
-    return btn_update(&s_btn[which]);
+    return btn_update(&s_btn[which], &s_cfg[which]);
 }
 
 uint32_t bsp_button_poll_all(void)
@@ -149,7 +168,7 @@ uint32_t bsp_button_poll_all(void)
     uint32_t mask = 0U;
 
     for (uint32_t i = 0U; i < (uint32_t)BSP_BTN_COUNT; i++) {
-        mask |= ((uint32_t)btn_update(&s_btn[i]) << (i * 4U));
+        mask |= ((uint32_t)btn_update(&s_btn[i], &s_cfg[i]) << (i * 4U));
     }
     return mask;
 }

@@ -1111,11 +1111,14 @@ void app_init(void)
           (int)s_speed_dir, (int)s_speed_target_rpm);
 #endif
 
-    /* ================= 第五步: 按键 (J11 排针) =================
+    /* ================= 第五步: 按键 =================
      * 只做引脚复用/上拉和消抖状态初始化, 采样与事件处理在 app_run 里
-     * (控制任务, 1kHz)。脚位与接线见 src/bsp/bsp_button.h。 */
+     * (控制任务, 1kHz)。脚位/上拉/映射表见 src/bsp/bsp_button.c 的 s_cfg[]。 */
     bsp_button_init();
-    LOG_I("BTN", "按键就绪: PD8(J11-42)=位置+  PC25(J11-27)=位置-  PD16(J11-12)=回起点");
+    LOG_I("BTN", "按键就绪: %s=位置+  %s=位置-  %s=回起点",
+          bsp_button_name(BSP_BTN_UP),
+          bsp_button_name(BSP_BTN_DOWN),
+          bsp_button_name(BSP_BTN_HOME));
 #if APP_FOC_CLOSED_LOOP_ENABLE
     LOG_I("APP", "motor ENABLED: CURRENT LOOP, iq_ref=%d mA, id_ref=%d mA, Kp=0.%02d V/A, Ki=%d V/(A*s), OC=%d mA",
           (int)(APP_FOC_IQ_REF_A * 1000.0f), (int)(APP_FOC_ID_REF_A * 1000.0f),
@@ -1475,16 +1478,21 @@ void app_run(void)
         }
 
         /* 接线排查: 上电后每 5 秒报一次三个按键的原始电平。
-         * 松开时应全为 0 (低有效), 若恒为 1 -> 引脚被拉低: 按键接错/短路/脚选错。 */
+         * 松开时应全为 0 (低有效)。若恒为 1 -> 那个脚被拉低(按键坏/短路/脚选错);
+         * 若按下时也不变 0 -> 按键没接上/焊盘不通。
+         * 板上 Key2/Key3 是 PC15/PC19, 有 10K 外部上拉, 手动按住时对应位应变成 1。 */
         {
             static uint32_t btn_log_tick;
 
             btn_log_tick += APP_MAIN_LOOP_MS;
             if (btn_log_tick >= 5000U) {
                 btn_log_tick = 0U;
-                LOG_I("BTN", "按键电平(PRO): up=%u down=%u home=%u (松开应全为 0)",
+                LOG_I("BTN", "按键电平: %s=%u %s=%u %s=%u (松开应全为 0, 按住该按键变 1)",
+                      bsp_button_name(BSP_BTN_UP),
                       (unsigned)bsp_button_raw_level(BSP_BTN_UP),
+                      bsp_button_name(BSP_BTN_DOWN),
                       (unsigned)bsp_button_raw_level(BSP_BTN_DOWN),
+                      bsp_button_name(BSP_BTN_HOME),
                       (unsigned)bsp_button_raw_level(BSP_BTN_HOME));
             }
         }
