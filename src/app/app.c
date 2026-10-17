@@ -1052,14 +1052,16 @@ void app_init(void)
           (unsigned)bsp_pwm_get_adc_trig_count(), (unsigned)bsp_pwm_get_reload());
 #endif
 #if APP_MOTION_ENABLE
-    /* 位置环: 初始化 + 使能。
-     * 使能瞬间会把"当前位置"设为目标(原地保持), 所以不会一上电就冲。
-     * 注意内环速度环由 APP_FOC_SPEED_LOOP_ENABLE 打开(见 app.h 的说明)。 */
+    /* 位置环: 只做初始化, 【先不要使能】。
+     *
+     * 【为什么必须等到方向自检之后】自检的做法是强行把速度给定设成 +6 RPM
+     * 跑 6ms, 靠"实测 rpm 往哪边走"判方向。如果位置环已经使能, 它会把电机
+     * 死死按在原地 —— 自检看到 rpm 几乎不动, 判据失效(实测会误判成"方向正常"),
+     * 于是带着错误的方向符号进入位置环, 一使能就是正反馈:
+     *     pos 从 4746 一路漂到 -8500000 mrad, err 顶满限幅, spdref=+60 饱和,
+     *     而 rpm=-553 —— 位置环越使劲、电机往反方向跑得越快。
+     * 所以顺序必须是: 电流环 -> 方向自检 -> 位置环使能(见下面)。 */
     app_motion_init(&s_motion);
-    app_motion_enable(&s_motion, true,
-                      app_encoder_get_mech_rad(&s_encoder));
-    LOG_I("MOT", "position loop ON: kp=%d mRPM/rad, 速度限幅=%d RPM",
-          (int)(APP_MOTION_POS_KP * 1000.0f), (int)APP_MOTION_SPEED_LIMIT_RPM);
 #endif
 
     /* ================= 第四步: 速度环反馈方向自检 =================
@@ -1120,6 +1122,21 @@ void app_init(void)
 #if APP_MOTION_ENABLE
     LOG_I("FOC", "speed loop: dir=%d, target=%d RPM (位置环每拍会重写它)",
           (int)s_speed_dir, (int)s_speed_target_rpm);
+#endif
+
+    /* ================= 第四步之二: 位置环使能 (必须在方向自检之后) =================
+     *
+     * 现在 s_speed_dir 已经由自检定下来了, 位置环才能安全使能:
+     *   - app_motion_enable() 会把"当前位置"设为目标(原地保持), 不会一上电就冲;
+     *   - 位置环内部分到 app_speed_get_dir() 取的方向系数就是上面自检定下的
+     *     那一个, 所以位置反馈和速度反馈必然同号, 不会再出现"位置环越使劲、
+     *     电机反向飞转"的正反馈。
+     * 【顺序不能反过来】反过来就是上一版实测到的现象(位置漂到 -8500000 mrad)。 */
+#if APP_MOTION_ENABLE
+    app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
+    LOG_I("MOT", "position loop ON: kp=%d mRPM/rad, 速度限幅=%d RPM, dir=%d",
+          (int)(APP_MOTION_POS_KP * 1000.0f), (int)APP_MOTION_SPEED_LIMIT_RPM,
+          (int)s_speed_dir);
 #endif
 
     /* ================= 第五步: 按键 =================
@@ -1273,6 +1290,12 @@ uint8_t app_speed_is_running(void)
     /* 【不要在这里读 s_ctrl】那会变成"显示任务读控制任务正在写的结构体"。
      * app_speed_apply() 每拍会把状态拍成 s_speed_ui_running, 这里只读快照。 */
     return s_speed_ui_running;
+}
+
+float app_speed_get_dir(void)
+{
+    /* 位置环用它保证和速度环同号, 见 app.h 的说明 */
+    return s_speed_dir;
 }
 
 uint8_t app_speed_is_calibrating(void)

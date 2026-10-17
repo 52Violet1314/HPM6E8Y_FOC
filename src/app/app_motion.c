@@ -8,21 +8,27 @@
 #include "app.h"            /* APP_MOTION_* */
 #include "foc_math.h"       /* FOC_PI / FOC_TWO_PI */
 
-/* 方向统一系数。
+/* ================= 方向统一: 只认一个来源 =================
  *
- * 【它统一的是谁】本模块内部的"位置正方向"要和【速度环/电流环的正方向】
- * 一致, 也就是"正 iq -> 位置读数增大"。而所用的机械角是
- *      mech_rad = FOC_ENCODER_DIRECTION * mt6701_angle_to_rad(raw)
- * 所以:
- *      FOC_ENCODER_DIRECTION = +1  ->  正 iq 让 mech_rad 增大 -> 这里取 +1
- *      FOC_ENCODER_DIRECTION = -1  ->  正 iq 让 mech_rad 减小 -> 这里取 -1
- * 写成表达式而不是写死, 就是为了避免"改了 foc_config.h 却忘了改这里"。
+ * 【规则】位置环和速度环必须【同号】。速度环在 app.c 里用的是
+ *      给定 = s_speed_target_rpm * s_speed_dir;   误差 = 给定 - rpm
+ * 而这里的位置反馈也必须用同一套"正方向", 否则两个环各自在自己的坐标系里,
+ * 一使能就是正反馈: 位置环输出正速度 -> 速度环按正速度出力 -> 电机往
+ * 负方向跑 -> 位置误差更大 -> 输出更大的正速度 ...... 实测就是这个:
+ *      pos 从 4746 漂到 -8500000 mrad, err=8500000, spdref=+60 饱和, rpm=-553
  *
- * 【注意它现在必须和速度环同号】速度环 (app.c) 是拿 app_encoder_get_mech_rpm()
- * 和给定比较的, 而那个 rpm 已经含了 FOC_ENCODER_DIRECTION。位置环如果单独
- * 反号, 两个环就在两个坐标系里, 一使能必然往一个方向冲到底(实测就是这样)。
- * 改方向只需要改 foc_config.h 的 FOC_ENCODER_DIRECTION, 这里自动跟随。 */
-#define APP_MOTION_DIR_SIGN   (FOC_ENCODER_DIRECTION)
+ * 【所以不再自己乘 FOC_ENCODER_DIRECTION】
+ *   以前这里硬编码 APP_MOTION_DIR_SIGN(-1), 而速度环默认 +1, 两边反号 ——
+ *   这才是"位置环一开就往一边冲"的直接原因。现在位置环直接用
+ *   app_speed_get_dir() 取速度环那同一个系数, 从根上保证同号。
+ *   要多圈展开的方向感也是同一件事: mech_rad 里已经含了
+ *   FOC_ENCODER_DIRECTION (见 app_encoder.c), 速度环也是用它, 所以这里
+ *   只要"直接用它、不再二次取反"即可。 */
+static float motion_dir(void)
+{
+    /* 速度环的方向系数 (由 app_init 自检/静态配置决定) */
+    return app_speed_get_dir();
+}
 
 static float motion_wrap_2pi(float a)
 {
@@ -93,7 +99,7 @@ void app_motion_enable(app_motion_t *m, bool enable, float mech_rad)
     }
     if (enable && !m->enable) {
         m->unwrap_valid = false;                      /* 重新建立展开基准 */
-        m->pos_fb       = APP_MOTION_DIR_SIGN * motion_unwrap(m, motion_wrap_2pi(mech_rad));
+        m->pos_fb       = motion_dir() * motion_unwrap(m, motion_wrap_2pi(mech_rad));
         m->pos_ref      = m->pos_fb;                  /* 原地保持 */
         m->speed_ref    = 0.0f;
     }
@@ -128,7 +134,7 @@ float app_motion_run(app_motion_t *m, float mech_rad)
         return 0.0f;
     }
 
-    m->pos_fb = APP_MOTION_DIR_SIGN * motion_unwrap(m, motion_wrap_2pi(mech_rad));
+    m->pos_fb = motion_dir() * motion_unwrap(m, motion_wrap_2pi(mech_rad));
 
     /* P 控制: 位置误差 -> 速度给定, 并限速(同时限制最大跟踪速度) */
     err          = m->pos_ref - m->pos_fb;
