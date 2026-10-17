@@ -16,8 +16,30 @@
 #define FOC_MOTOR_LS_HENRY              (0.0013f)   /* 相电感 (H) = 1.3mH —— 同样按相值 */
 #define FOC_MOTOR_FLUX_WB               (0.0f)      /* 磁链 (Wb), 未知填 0 */
 
-/* ---- 编码器安装 ---- */
-#define FOC_ENCODER_DIRECTION           (1.0f)      /* +1 或 -1, 编码器正方向与电机正方向关系 */
+/* ---- 编码器安装 ----
+ *
+ * 【方向 = -1, 这是实测确定的, 不是猜的】
+ * 判据来自一整段连续日志(不是单点): 正 iq 时电机物理上在正转, 但编码器
+ * 原始计数【单调减小】。证据链:
+ *    iq_ref=+1500mA, uq 顶到 5660mV(电流环在往正方向满力推)
+ *    rpm 报 -558, 位置报 -2000000 mrad(一路变负)
+ *    vbus 有反电势 -> 电机确实在转
+ *   => 正 iq 让 raw 减小, 所以"raw 增大"对应的是【电机负方向】。
+ * mech_rad = FOC_ENCODER_DIRECTION * raw, 要让它随电机正转增大, 必须取 -1。
+ *
+ * 【这一处错了会导致什么】mech_rpm 和位置反馈的符号会一起反:
+ *    速度环: 给定 +60 -> 实测 -558 -> 误差 +618 -> iq 顶正限幅
+ *            -> 正 iq 让电机正转 -> 编码器报更负 -> 正反馈 -> 飞车
+ *    位置环: 目标 5887 -> 反馈一路变负 -> 误差涨到 2e6 -> 速度给定拉满
+ *  表现就是"上电电机一直转、iq 为正、uq 顶限幅、pos 无限漂移"。
+ * 即 FOC_ENCODER_DIRECTION 用错时, 任何下游的符号修正都只是把错误搬到别处。
+ *
+ * 【它不影响换向】本工程用内置离线 LUT 换向 (APP_ENC_USE_BUILTIN_LUT=1),
+ * 电角度由 app_enc_lut_elec_rad(raw) 直接给出, 与这个宏无关;
+ * 这个宏只作用于 mech_rad / mech_rpm(速度估算与位置反馈)。
+ * 【改它之后要同步】app.h 的 APP_SPEED_DIR_SIGN 应保持 +1(此时
+ * "正 iq -> 正 rpm" 已经成立), 不要再叠一次取反。 */
+#define FOC_ENCODER_DIRECTION           (-1.0f)     /* 实测: 正 iq 让 raw 减小 -> -1 */
 /* 电角度偏置 (rad)。
  *
  * 【怎么来的】用静态角度扫描标定 (app.h 的 APP_CAL_SWEEP_ENABLE):
