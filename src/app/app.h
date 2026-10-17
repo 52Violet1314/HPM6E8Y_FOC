@@ -244,6 +244,20 @@ extern "C" {
 #define APP_FOC_SPEED_LOOP_ENABLE   (1)
 
 #if APP_FOC_SPEED_LOOP_ENABLE
+/* 【速度环是"内环"，它不该成为用户感知到的模式】
+ * 下面这条必须在"位置环已使能"时把自检关掉, 原因很具体:
+ *   自检的做法是【强行把速度给定设成 +6 RPM 跑 6ms】再撤销。如果位置环已经
+ *   使能, 这 6ms 的强行给定就变成了一次"不请自来的速度指令" —— 电机会在你
+ *   什么都没按的时候先抽一下; 更糟的是自检结束时会把给定清零, 而位置环的
+ *   速度给定本来是"跟着位置误差连续变化"的, 这一清零会造成一次跳变。
+ * 所以: 自检只在"单独用速度环"时有意义。用位置环时方向由位置环实测兜底
+ * (见 app.c 的位置环部分), 不需要也不应该在上电瞬间抢速度给定。 */
+#if APP_MOTION_ENABLE
+#define APP_SPEED_DIR_AUTOTEST      (0)
+#else
+#define APP_SPEED_DIR_AUTOTEST      (1)
+#endif
+
 /* 速度环 PI (1kHz 下发, ts = 1ms)。
  *   机械时间常数远大于电时间常数, 所以速度环要比电流环慢得多:
  *     Kp = 0.02 A/RPM -> 1000RPM 误差给 20A, 被 FOC_CURRENT_LIMIT_A 夹住;
@@ -270,9 +284,11 @@ extern "C" {
  *
  * 静态默认值 +1 —— 因为 foc_config.h 里 FOC_ENCODER_DIRECTION = +1, 即"编码器
  * 读数增大 = 电机正转"(2026-10-14 校准出来的结论)。若自检报"方向正常"却仍然
- * 一使能就往一个方向冲, 那就是这条链上还有别的环节反了, 把这里改成 -1。 */
+ * 一使能就往一个方向冲, 那就是这条链上还有别的环节反了, 把这里改成 -1。
+ *
+ * APP_SPEED_DIR_AUTOTEST 的值在上面的 #if APP_MOTION_ENABLE 里决定
+ * (用位置环时=0, 单独用速度环时=1), 这里不再重复定义。 */
 #define APP_SPEED_DIR_SIGN          (1.0f)
-#define APP_SPEED_DIR_AUTOTEST      (1)
 
 /* 自检用的"速度给定"和持续时间。
  * 【为什么这么小】自检期间 iq ≈ Kp × 给定 (积分才刚起步), 所以

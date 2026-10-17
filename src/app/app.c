@@ -591,14 +591,25 @@ void app_init(void)
     foc_controller_set_voltage(&s_ctrl, APP_OPENLOOP_VOLTAGE_V);
     foc_controller_set_current_limit(&s_ctrl, APP_OPENLOOP_CURRENT_LIMIT);
 
-    /* 转速给定复位到默认值。
+    /* 转速给定复位。
      * 【注意】这里不能调 app_speed_target_set(): 它会顺手把开环频率给定也改掉,
      * 而本函数后面那几段 (#elif) 才决定最终的工作点 (开环 V/F / 静态扫描 / 查表
-     * 换向), 顺序反了会把它们的设定覆盖掉。只复位目标值, 下发交给 app_speed_apply()。 */
+     * 换向), 顺序反了会把它们的设定覆盖掉。只复位目标值, 下发交给 app_speed_apply()。
+     *
+     * 【为什么用位置环时初值必须是 0, 而不是 600】
+     *   速度环在 app_init 里就已经使能了, 而位置环要等到本函数后面才 enable()。
+     *   如果这里留 600, 上电到"位置环第一次跑起来"之间, 速度给定就是 600 RPM ——
+     *   这段时间短, 但足以让速度环把 iq 顶上去、电机抽一下; 更糟的是如果位置环
+     *   那次 enable 失败(参数/编码器异常), 电机就一直追 600。默认给 0 才是
+     *   "谁都没让它动, 它就不动"。 */
+#if APP_MOTION_ENABLE
+    s_speed_target_rpm = 0.0f;
+#else
     s_speed_target_rpm = APP_SPEED_TARGET_DEFAULT_RPM;
-    LOG_I("APP", "speed setpoint: target=%d RPM (LCD slider), ramp=%d RPM/s, speed_loop=%d",
-          (int)APP_SPEED_TARGET_DEFAULT_RPM, (int)APP_SPEED_RAMP_RPM_S,
-          (int)APP_FOC_SPEED_LOOP_ENABLE);
+#endif
+    LOG_I("APP", "speed setpoint: target=%d RPM, ramp=%d RPM/s, speed_loop=%d, motion_loop=%d",
+          (int)s_speed_target_rpm, (int)APP_SPEED_RAMP_RPM_S,
+          (int)APP_FOC_SPEED_LOOP_ENABLE, (int)APP_MOTION_ENABLE);
 
 
     /* ---- 非易失校准数据 (Flash) ----
