@@ -1090,36 +1090,64 @@ void app_init(void)
      * 【前提】电机必须【空载】—— 带载时转子被负载拖住/反转, 判据不可信。 */
 #if APP_FOC_CLOSED_LOOP_ENABLE && APP_FOC_SPEED_LOOP_ENABLE && APP_SPEED_DIR_AUTOTEST
     {
-        float    rpm_before;
-        float    rpm_delta;
+        uint16_t raw_before;
+        int32_t  raw_delta;
         float    vbus_f = (float)bsp_adc_get_vbus_mv() * 0.001f;
         uint32_t i;
 
         s_speed_dir = APP_SPEED_DIR_SIGN;
 
-        /* 旁路速度环: 直接给固定 iq (d 轴给 0)。iq>0 就等于"命令电机往 iq
+        /* 【判据用"原始编码器角"而不是滤波后的 rpm】
+         * 之前用 app_encoder_get_mech_rpm() 判方向, 而它是 foc_speed_est_update()
+         * 的低通输出(alpha=0.1): 8ms 只有 8 个样本, 滤波值远没跟上真实速度,
+         * 判据等于在噪声里取符号 —— 实测两次都判错。
+         * 原始角是"直接读数", 没有任何滤波/环路参与, 只要窗口够长、
+         * 电流够大让转子真的转起来, 符号就是确定的。 */
+        raw_before = bsp_mt6701_get_raw_angle();
+
+        /* 旁路速度环: 直接给固定 iq (d 轴 0)。iq>0 等价于"命令电机往 iq
          * 正方向出力", 与 s_speed_dir 无关 —— 这正是判据干净的原因。 */
         foc_controller_set_current_ref(&s_ctrl, 0.0f, APP_SPEED_DIR_TEST_IQ_A);
 
-        rpm_before = app_encoder_get_mech_rpm(&s_encoder);
         for (i = 0U; i < (APP_SPEED_DIR_TEST_MS / APP_MAIN_LOOP_MS); i++) {
             app_init_run_cycles(1U, vbus_f);
         }
-        rpm_delta = app_encoder_get_mech_rpm(&s_encoder) - rpm_before;
 
-        /* 收尾: 电流归零, 交回速度环/位置环 */
+        raw_delta = (int32_t)bsp_mt6701_get_raw_angle() - (int32_t)raw_before;
+        /* 14bit 编码器, 按最短路径解卷绕(窗口内转角远小于半圈) */
+        if (raw_delta >  8192) {
+            raw_delta -= 16384;
+        } else if (raw_delta < -8192) {
+            raw_delta += 16384;
+        }
+
+        /* 收尾: 电流归零, 交回速度环/位置环。积分必须清 —— 测试期间如果
+         * 转子转到 ±几十 RPM, 速度环的积分会攒下饱和值。 */
         foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, 0.0f);
         s_speed_target_rpm = 0.0f;
         s_spd_integ        = 0.0f;
 
-        /* 判据用 Δ 的符号而不是绝对阈值: 空载时几毫秒内速度变化很小, 但
-         * 符号是确定的(编码器 1ms 采一次, 窗口内 6 个样本)。 */
-        s_speed_dir = (rpm_delta < 0.0f) ? -APP_SPEED_DIR_SIGN : APP_SPEED_DIR_SIGN;
-
-        LOG_I("FOC", "方向标定: 给 iq=+%d mA 跑 %dms, 实测 rpm %d -> %d (d=%d) -> s_speed_dir=%d",
-              (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
-              (int)rpm_before, (int)(rpm_before + rpm_delta), (int)rpm_delta,
-              (int)s_speed_dir);
+        /* 判据: 正 iq 让原始角增大 -> 编码器正方向和 iq 正方向一致(+1);
+         *       原始角减小 -> 反向(-1)。
+         *
+         * 【幅值门限】如果转子被齿槽/静摩擦顶住几乎没动(或窗口太短),
+         * 符号就是噪声 —— 这时【不要】随手判一个方向, 而是保留静态默认值并
+         * 明确告警, 让人上板处理(加电流/空载)。200 counts 对应机械角
+         * 200/16384*360 ≈ 4.4°, 远大于编码器噪声, 又远小于本窗口的正常转角。 */
+        if ((raw_delta > 200) || (raw_delta < -200)) {
+            s_speed_dir = (raw_delta < 0) ? -APP_SPEED_DIR_SIGN : APP_SPEED_DIR_SIGN;
+            LOG_I("FOC", "方向标定: iq=+%d mA x %dms -> raw %u -> %u (d=%ld), s_speed_dir=%d",
+                  (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
+                  (unsigned)raw_before, (unsigned)bsp_mt6701_get_raw_angle(),
+                  (long)raw_delta, (int)s_speed_dir);
+        } else {
+            s_speed_dir = APP_SPEED_DIR_SIGN;
+            LOG_I("FOC", "!! 方向标定失败: iq=+%d mA x %dms 只让 raw 动了 %ld counts "
+                         "(需要 >200) -> 转子可能被顶住/带载。保留静态 dir=%d, "
+                         "请空载重试或加大 APP_SPEED_DIR_TEST_IQ_A",
+                  (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
+                  (long)raw_delta, (int)s_speed_dir);
+        }
     }
 #endif
 #if APP_MOTION_ENABLE
@@ -1131,13 +1159,26 @@ void app_init(void)
      *
      * 现在 s_speed_dir 已经由自检定下来了, 位置环才能安全使能:
      *   - app_motion_enable() 会把"当前位置"设为目标(原地保持), 不会一上电就冲;
-     *   - 位置环内部分到 app_speed_get_dir() 取的方向系数就是上面自检定下的
-     *     那一个, 所以位置反馈和速度反馈必然同号, 不会再出现"位置环越使劲、
+     *   - 位置环内部取的方向系数就是上面自检定下的那一个,
+     *     所以位置反馈和速度反馈必然同号, 不会再出现"位置环越使劲、
      *     电机反向飞转"的正反馈。
-     * 【顺序不能反过来】反过来就是上一版实测到的现象(位置漂到 -8500000 mrad)。 */
+     * 【顺序不能反过来】反过来就是上一版实测到的现象(位置漂到 -8500000 mrad)。
+     *
+     * 【必须先读一次编码器!】这是一个独立的坑:
+     *   在 app_init 走到这里之前, s_encoder.mech_rad 一直是 0
+     *   (app_encoder_init() 只做 memset)。若直接 app_motion_enable(...,
+     *   app_encoder_get_mech_rad()) 传进去的就是 0 -> 目标被设成 0,
+     *   而转子实际停在某个非零角度(14bit 任意值) -> 上电瞬间就有一个
+     *   最大 2π 的位置误差 -> 位置环立刻满力去"追 0 度"。
+     *   所以这里先 poll 一次再 update, 让 mech_rad 是真实值。
+     *   实测里 ref=4746 mrad 却 pos=344137 mrad 这种"一开始就差很远"的现象,
+     *   有一部分就是这个原因造成的。 */
 #if APP_MOTION_ENABLE
+    (void)bsp_mt6701_poll();
+    (void)app_encoder_update(&s_encoder);
     app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
-    LOG_I("MOT", "position loop ON: kp=%d mRPM/rad, 速度限幅=%d RPM, dir=%d",
+    LOG_I("MOT", "position loop ON: pos0=%d mrad, kp=%d mRPM/rad, 速度限幅=%d RPM, dir=%d",
+          (int)(s_motion.pos_fb * 1000.0f),
           (int)(APP_MOTION_POS_KP * 1000.0f), (int)APP_MOTION_SPEED_LIMIT_RPM,
           (int)s_speed_dir);
 #endif
@@ -2235,9 +2276,17 @@ void app_run(void)
 #if APP_MOTION_ENABLE
             /* 带上位置环数据: 目标是 posref, 反馈是 pos, 两者之差 err 就是位置环的
              * 输入; spdref 是位置环给出的速度给定(交给速度环)。调位置环看这行:
-             *   err 长时间不归零 -> pos_kp 太小; err 反复过零/来回摆 -> pos_kp 太大。 */
-            LOG_I("FOC", "id=%d iq=%d mA (ref %d/%d) ud=%d uq=%d mV vbus=%d mV rpm=%d sign=%d | "
-                         "pos=%d mrad ref=%d mrad err=%d mrad spdref=%d rpm",
+             *   err 长时间不归零 -> pos_kp 太小; err 反复过零/来回摆 -> pos_kp 太大。
+             *
+             * 【这一行里的每个量都是独立可核对的, 排查方向时按这个顺序看】
+             *   dir    = s_speed_dir (方向系数), 必须和 pos/raw 的走法自洽;
+             *   raw    = 编码器原始角 (14bit), 它和 pos 必须【同向】增减;
+             *   rpm    = 滤波后的机械转速, 它和 raw 的差分必须【同向】;
+             *   spdref = 位置环给出的速度给定;
+             *   iq     = 速度环 PI 的输出, 它和 (spdref - rpm) 必须【同向】。
+             * 任何一对不同向, 那一对之间的环节就是反的 —— 不用再猜。 */
+            LOG_I("FOC", "id=%d iq=%d mA (ref %d/%d) ud=%d uq=%d mV vbus=%d mV rpm=%d dir=%d | "
+                         "pos=%d ref=%d err=%d mrad spdref=%d rpm raw=%u",
                   (int)(s_ctrl.foc.id * 1000.0f),
                   (int)(s_ctrl.foc.iq * 1000.0f),
                   (int)(s_ctrl.foc.id_ref * 1000.0f),
@@ -2246,11 +2295,12 @@ void app_run(void)
                   (int)(s_ctrl.foc.uq * 1000.0f),
                   (int)bsp_adc_get_vbus_mv(),
                   (int)app_encoder_get_mech_rpm(&s_encoder),
-                  (int)s_cur_sign,
+                  (int)s_speed_dir,
                   (int)(app_motion_get_pos(&s_motion) * 1000.0f),
                   (int)(s_motion.pos_ref * 1000.0f),
                   (int)(app_motion_get_err(&s_motion) * 1000.0f),
-                  (int)s_motion.speed_ref);
+                  (int)s_motion.speed_ref,
+                  (unsigned)bsp_mt6701_get_raw_angle());
 #else
             LOG_I("FOC", "id=%d iq=%d mA (ref %d/%d) ud=%d uq=%d mV vbus=%d mV rpm=%d sign=%d",
                   (int)(s_ctrl.foc.id * 1000.0f),
