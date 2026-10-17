@@ -247,14 +247,12 @@ void lcd_ui_refresh(float rpm, float target, float target_eff,
     }
     s_ui.tick_ms = 0U;
 
-    /* ---- 实测转速 ---- */
+    /* ---- 实测转速 ----
+     *
+     * 【超速/反转用颜色提示】正转青, 反转或标定中黄, 接近限幅红。 */
     rpm_i = (int32_t)((rpm >= 0.0f) ? (rpm + 0.5f) : (rpm - 0.5f));
 
-    /* 超速 / 反转用颜色提示: 正转青, 反转或标定中黄, 接近限幅红。
-     * 颜色只在这三种之外才变化, 所以放在"数值没变"分支外面判一次即可。 */
-    if (busy != 0U) {
-        color = UI_WARN;
-    } else if (rpm_i < 0) {
+    if ((busy != 0U) || (rpm_i < 0)) {
         color = UI_WARN;
     } else if ((float)rpm_i > APP_FOC_RPM_LIMIT * 0.9f) {
         color = UI_BAD;
@@ -262,16 +260,37 @@ void lcd_ui_refresh(float rpm, float target, float target_eff,
         color = UI_ACCENT;
     }
 
-    if (((uint32_t)rpm_i != s_ui.last_rpm_text) || (color != last_rpm_color)) {
-        char tmp[16];
+    /* 【为什么必须限幅再显示】大字是 montserrat_40, x 从 12 开始, 屏宽只有 320。
+     * 40px 字体一个数字约 22~24px 宽, 所以**最多只能放 4 个字符**(约 96~110px),
+     * 加上负号就是 "-999"。
+     * 而实测转速在符号错/堵转时会冲到几百甚至上千 RPM —— "-1042" 或编码器异常
+     * 时的 "-2147483" 会直接画到屏幕外面, 看起来就是"转速那块什么都没显示"。
+     * 所以这里把显示值夹在 ±999。【注意】这只影响显示, 不影响控制。 */
+    {
+        int32_t shown = rpm_i;
 
-        s_ui.last_rpm_text = (uint32_t)rpm_i;
-        (void)snprintf(tmp, sizeof(tmp), "%d", (int)rpm_i);
-        ui_text(s_ui.lbl_rpm, s_ui.rpm, sizeof(s_ui.rpm), tmp);
+        if (shown > 999) {
+            shown = 999;
+        } else if (shown < -999) {
+            shown = -999;
+        }
 
-        if (color != last_rpm_color) {
-            last_rpm_color = color;
-            lv_obj_set_style_text_color(s_ui.lbl_rpm, lv_color_hex(color), 0);
+        /* 去重用的键要把"显示值"和"是否越界"都算进去, 否则 999/1000 看起来一样 */
+        {
+            uint32_t key = (uint32_t)shown ^ (((rpm_i != shown) ? 1U : 0U) << 20);
+
+            if ((key != s_ui.last_rpm_text) || (color != last_rpm_color)) {
+                char tmp[16];
+
+                s_ui.last_rpm_text = key;
+                (void)snprintf(tmp, sizeof(tmp), "%d", (int)shown);
+                ui_text(s_ui.lbl_rpm, s_ui.rpm, sizeof(s_ui.rpm), tmp);
+
+                if (color != last_rpm_color) {
+                    last_rpm_color = color;
+                    lv_obj_set_style_text_color(s_ui.lbl_rpm, lv_color_hex(color), 0);
+                }
+            }
         }
     }
 

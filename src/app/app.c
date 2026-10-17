@@ -1523,12 +1523,34 @@ void app_run(void)
      * 正好是 1kHz; 而且按键最终要改位置目标, 这个目标只允许控制任务改。
      * 【每拍只走一步】按下/连发一次只把目标挪 APP_BTN_STEP_RAD (5°),
      * 并把目标限幅在"当前位置 ±APP_BTN_TARGET_WINDOW_RAD"之内 —— 防止连按堆出
-     * 一个很大的位置误差, 一松手就满速冲过去撞限位。 */
+     * 一个很大的位置误差, 一松手就满速冲过去撞限位。
+     *
+     * 【上电屏蔽窗口】前 APP_BTN_BOOT_IGNORE_MS 内【丢弃所有按键事件】。
+     * 这是被实测坑出来的: PC15/PC19 若因外部上拉未焊而浮空, 上电瞬间会被读成
+     * "按下", 触发 HOME -> 把位置目标设成 0, 而转子实际停在非零角度 ->
+     * 位置环立刻满力去追 0 => "上电电机就一直转"。
+     * 消抖窗(20ms)挡不住这种"上电就一直低"的假按下(它会被当成一直按住),
+     * 所以必须用一段开机屏蔽期。屏蔽期内按键状态照常采样(消抖正常进行),
+     * 只是不产生事件。 */
     {
-        uint32_t ev = bsp_button_poll_all();
-        uint8_t  e_up   = (uint8_t)((ev >> ((uint32_t)BSP_BTN_UP   * 4U)) & 0xFU);
-        uint8_t  e_down = (uint8_t)((ev >> ((uint32_t)BSP_BTN_DOWN * 4U)) & 0xFU);
-        uint8_t  e_home = (uint8_t)((ev >> ((uint32_t)BSP_BTN_HOME * 4U)) & 0xFU);
+        static uint32_t s_boot_ms;
+        uint32_t ev;
+        uint8_t  e_up, e_down, e_home;
+
+        ev = bsp_button_poll_all();
+
+        if (s_boot_ms < APP_BTN_BOOT_IGNORE_MS) {
+            s_boot_ms += APP_MAIN_LOOP_MS;
+            e_up = e_down = e_home = BSP_BTN_EV_NONE;
+
+            if (s_boot_ms == APP_BTN_BOOT_IGNORE_MS) {
+                LOG_I("BTN", "按键屏蔽期结束, 此后按键才生效");
+            }
+        } else {
+            e_up   = (uint8_t)((ev >> ((uint32_t)BSP_BTN_UP   * 4U)) & 0xFU);
+            e_down = (uint8_t)((ev >> ((uint32_t)BSP_BTN_DOWN * 4U)) & 0xFU);
+            e_home = (uint8_t)((ev >> ((uint32_t)BSP_BTN_HOME * 4U)) & 0xFU);
+        }
 
         if (e_up != BSP_BTN_EV_NONE) {
             float tgt = app_motion_get_target_rad() + APP_BTN_STEP_RAD;

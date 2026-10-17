@@ -57,14 +57,19 @@ typedef struct {
  *   DOWN = 板上 Key3 (SW6 / KEYC / PC19)  -> 位置 -
  *   HOME = J11 PD8 (脚 42, 外接)          -> 回起点(重新定零)
  *
- * 【HOME 为什么留在 J11】板上三个键里 Key1 已坏, 只剩两个可用; 把两个好键留给
- * 调速(最常用), "回起点"这种低频操作留给 J11 外接的一个微动开关。
- * 如果你不想接第三个键, 把 HOME 那行的 pad/func/pin 改成和 UP/DOWN 一样的
- * GPIO 也行 —— 代价是那个功能一直不触发, 不影响其他两个键。 */
+ * 【pull_up 全部填 1 —— 这是踩过坑的】
+ *   原理图上 PC15/PC19 有 10K 外部上拉, 所以第一版这里填 0(不开内部上拉)。
+ *   但实测上电后电机会自己跑: 位置目标被改成了 0, 而转子实际停在非零角度。
+ *   原因就是这两个脚【浮空】—— 板子上的外部上拉不一定焊了(Key1 已经坏了,
+ *   说明这几个按键的硬件本身未必齐全), 浮空脚被噪声/漏电拉低后
+ *   bsp_button_raw_level() 读成"按下" -> 触发 HOME -> 目标归零 -> 位置环
+ *   看到几弧度的误差 -> 满力去追。
+ *   开内部上拉是安全的: 有外部 10K 时两者并联, 只是"松开"更硬一点;
+ *   没有外部上拉时它就是唯一的上拉。所以【这里一律开】。 */
 static const btn_cfg_t s_cfg[BSP_BTN_COUNT] = {
     /* port                          pin                    pad                func                              pull name   */
-    { GPIO_DI_GPIOC,                 15U, IOC_PAD_PC15, IOC_PC15_FUNC_CTL_GPIO_C_15, 0U, "Key2/PC15" },
-    { GPIO_DI_GPIOC,                 19U, IOC_PAD_PC19, IOC_PC19_FUNC_CTL_GPIO_C_19, 0U, "Key3/PC19" },
+    { GPIO_DI_GPIOC,                 15U, IOC_PAD_PC15, IOC_PC15_FUNC_CTL_GPIO_C_15, 1U, "Key2/PC15" },
+    { GPIO_DI_GPIOC,                 19U, IOC_PAD_PC19, IOC_PC19_FUNC_CTL_GPIO_C_19, 1U, "Key3/PC19" },
     { GPIO_DI_GPIOD,                  8U, IOC_PAD_PD08, IOC_PD08_FUNC_CTL_GPIO_D_08, 1U, "J11/PD8"   },
 };
 
