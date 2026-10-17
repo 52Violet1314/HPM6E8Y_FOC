@@ -136,9 +136,18 @@ float app_motion_run(app_motion_t *m, float mech_rad)
 
     m->pos_fb = motion_dir() * motion_unwrap(m, motion_wrap_2pi(mech_rad));
 
-    /* P 控制: 位置误差 -> 速度给定, 并限速(同时限制最大跟踪速度) */
-    err          = m->pos_ref - m->pos_fb;
-    m->speed_ref = motion_clamp(m->pos_kp * err, m->speed_limit);
+    /* P 控制: 位置误差 -> 速度给定, 并限速(同时限制最大跟踪速度)
+     *
+     * 【死区】|误差| <= APP_MOTION_DEADBAND_RAD 时直接给 0 速度。
+     * 编码器 14bit, 1 count ≈ 0.38 mrad, 位置环在目标附近会一直追最后几个
+     * count —— 表现为"到位后轻微嗡嗡"。4 mrad(0.23°)的死区让它真正停住,
+     * 死区外仍是纯 P, 不引入额外滞后。 */
+    err = m->pos_ref - m->pos_fb;
+    if ((err > -APP_MOTION_DEADBAND_RAD) && (err < APP_MOTION_DEADBAND_RAD)) {
+        m->speed_ref = 0.0f;
+    } else {
+        m->speed_ref = motion_clamp(m->pos_kp * err, m->speed_limit);
+    }
 
     return m->speed_ref;
 }
