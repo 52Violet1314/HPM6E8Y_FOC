@@ -1064,59 +1064,62 @@ void app_init(void)
     app_motion_init(&s_motion);
 #endif
 
-    /* ================= 第四步: 速度环反馈方向自检 =================
+    /* ================= 第四步: 方向标定 (物理量判据) =================
      *
-     * 【为什么必须做】速度环是"负反馈", 但反馈回来的 rpm 是否和 iq 同号,
-     * 取决于三件互相独立的事: 编码器计数方向、相电流极性(自检出来是 ±1)、
-     * 以及 FOC 的电角度约定。任何一处反了, 速度环就成了【正反馈】:
-     *     正给定 -> 正的 iq -> 实测转速却是负的 -> 误差更大 -> iq 更大 ...
-     * iq 会一路顶到 APP_FOC_SPEED_IQ_LIMIT_A 饱和, 转子被"反向拖住"。
-     * 实测日志里的现场就是: iq=+147mA(顶到限幅) 而 rpm=-553 —— 正是这个。
+     * 【为什么不能"给定转速看 rpm 符号"】上一版就是这么干的, 实测会判错 ——
+     * 那个判据自己把符号绕回去了:
+     *     速度环内部算的是 target * s_speed_dir - rpm
+     *   拿 s_speed_target_rpm 当刺激, 刺激要经过 s_speed_dir 才变成真正的给定;
+     *   只要 s_speed_dir 初值和实际相反, 环路会自己把"正刺激"翻成"负出力",
+     *   而测得的速度符号又跟着翻 —— 读到的是"环路的行为", 不是"编码器和 iq
+     *   的物理关系"。实测两次: 一次 rpm=-553/spdref=+60, 一次 rpm=+566/
+     *   spdref=-60, 两次都是"给定与实际反号"的正反馈。
      *
-     * 【怎么测】把速度环给定设成 +APP_SPEED_DIR_TEST_RPM, 只跑
-     * APP_SPEED_DIR_TEST_MS, 然后看实测 rpm 朝哪边走。因为
-     *      |给定| = 测试转速, e ≈ 测试转速, iq ≈ Kp·e
-     * 所以只要把测试转速选得让 Kp·e 落在安全电流内就行 (见 app.h 的宏),
-     * 而且这段时间速度环自己的 PI 会限制电流, 不会失控。
-     * 测出来是负的就把 s_speed_dir 翻成 -1 (之后所有给定/反馈都过这个系数)。
+     * 【现在的判据: 直接给固定 iq, 量速度怎么变】
+     *   把速度环【整个旁路】(直接 foc_controller_set_current_ref), 给
+     *   +APP_SPEED_DIR_TEST_IQ_A 这个很小的电流, 看实测 rpm 的变化方向:
+     *       rpm 变大 -> 正 iq 让编码器 rpm 变大 -> s_speed_dir = +1
+     *       rpm 变小 -> 正 iq 让编码器 rpm 变小 -> s_speed_dir = -1
+     *   这个判据里没有任何反馈环, 符号不会被绕回去; 位置环此刻也还没使能,
+     *   不会被位置环按住而"测不出来"。
      *
-     * 【前提】电机必须【空载】—— 带载时转子被负载拖住/反转, 判据不可信。
-     * 不需要这个自检时把 APP_SPEED_DIR_AUTOTEST 置 0, 直接信
-     * APP_SPEED_DIR_SIGN 的静态值。 */
+     * 【为什么必须做】位置环和速度环必须同号, 否则就是正反馈(位置环越使劲,
+     * 电机往反方向跑得越快 —— 实测 pos 漂到 -8500000 mrad)。这里是唯一能把
+     * "编码器计数方向 × 相电流极性 × FOC 角度约定"三者合成符号实测出来的地方。
+     *
+     * 【前提】电机必须【空载】—— 带载时转子被负载拖住/反转, 判据不可信。 */
 #if APP_FOC_CLOSED_LOOP_ENABLE && APP_FOC_SPEED_LOOP_ENABLE && APP_SPEED_DIR_AUTOTEST
     {
         float    rpm_before;
-        float    rpm_after;
+        float    rpm_delta;
         float    vbus_f = (float)bsp_adc_get_vbus_mv() * 0.001f;
         uint32_t i;
 
         s_speed_dir = APP_SPEED_DIR_SIGN;
-        s_spd_integ = 0.0f;
+
+        /* 旁路速度环: 直接给固定 iq (d 轴给 0)。iq>0 就等于"命令电机往 iq
+         * 正方向出力", 与 s_speed_dir 无关 —— 这正是判据干净的原因。 */
+        foc_controller_set_current_ref(&s_ctrl, 0.0f, APP_SPEED_DIR_TEST_IQ_A);
 
         rpm_before = app_encoder_get_mech_rpm(&s_encoder);
-        s_speed_target_rpm = APP_SPEED_DIR_TEST_RPM;
-
-        /* 用与运行期完全相同的控制路径跑: 这样"实测速度"就是运行期看到的那个量 */
         for (i = 0U; i < (APP_SPEED_DIR_TEST_MS / APP_MAIN_LOOP_MS); i++) {
             app_init_run_cycles(1U, vbus_f);
-            app_speed_apply();
         }
+        rpm_delta = app_encoder_get_mech_rpm(&s_encoder) - rpm_before;
 
-        rpm_after = app_encoder_get_mech_rpm(&s_encoder);
-
-        s_speed_target_rpm = 0.0f;      /* 回到停止, 交给位置环接管 */
+        /* 收尾: 电流归零, 交回速度环/位置环 */
+        foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, 0.0f);
+        s_speed_target_rpm = 0.0f;
         s_spd_integ        = 0.0f;
 
-        if (rpm_after < rpm_before) {
-            s_speed_dir = -s_speed_dir;
-            LOG_I("FOC", "速度环方向自检: 给定 +%d RPM -> 实测 %d -> %d RPM, 判定反馈反向, s_speed_dir=%d",
-                  (int)APP_SPEED_DIR_TEST_RPM, (int)rpm_before, (int)rpm_after,
-                  (int)s_speed_dir);
-        } else {
-            LOG_I("FOC", "速度环方向自检: 给定 +%d RPM -> 实测 %d -> %d RPM, 方向正常, s_speed_dir=%d",
-                  (int)APP_SPEED_DIR_TEST_RPM, (int)rpm_before, (int)rpm_after,
-                  (int)s_speed_dir);
-        }
+        /* 判据用 Δ 的符号而不是绝对阈值: 空载时几毫秒内速度变化很小, 但
+         * 符号是确定的(编码器 1ms 采一次, 窗口内 6 个样本)。 */
+        s_speed_dir = (rpm_delta < 0.0f) ? -APP_SPEED_DIR_SIGN : APP_SPEED_DIR_SIGN;
+
+        LOG_I("FOC", "方向标定: 给 iq=+%d mA 跑 %dms, 实测 rpm %d -> %d (d=%d) -> s_speed_dir=%d",
+              (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
+              (int)rpm_before, (int)(rpm_before + rpm_delta), (int)rpm_delta,
+              (int)s_speed_dir);
     }
 #endif
 #if APP_MOTION_ENABLE
