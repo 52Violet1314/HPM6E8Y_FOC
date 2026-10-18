@@ -74,6 +74,19 @@ void app_log_write(app_log_level_t level, const char *tag, const char *fmt, ...)
 void app_log_write_raw(const char *line);
 
 /**
+ * @brief  绕开日志队列, 立刻写所有后端
+ * @param  line  已格式化好的文本 (不含结尾 '\n')
+ * @note   只有两处该用它:
+ *           1) core0 的日志任务把 core1 攒在共享内存里的日志搬出来转发
+ *              (见 src/dualcore/core1_boot.c 的 core1_log_drain) —— 它本身就跑在
+ *              日志任务里, 再入队等于自己给自己发消息, 白白多绕一圈还可能把队列塞满;
+ *           2) 调度器起来之前的致命错误路径。
+ *         其它场合请用 LOG_* / app_log_write_raw(), 别在控制任务里直接调它 ——
+ *         那会把 vsnprintf 之后的串口写出重新拉回控制任务。
+ */
+void app_log_write_direct(const char *line);
+
+/**
  * @brief  日志任务的循环体 (由 RTOS 的日志任务调用, 内部不返回)
  *
  * 【为什么要有它】LOG_* 现在只把"格式化好的行"塞进队列, 真正的后写出
@@ -86,6 +99,21 @@ void app_log_task_body(void);
 #ifdef __cplusplus
 }
 #endif
+
+/**
+ * @brief  非阻塞控制台写出 (printf / newlib 的 _write 最终都落到这里)
+ * @param  data  要写出的字节(可以不是一整行)
+ * @param  size  字节数
+ * @return 实际"收下"的字节数; 缓冲满时只收一部分(丢弃剩余), 绝不等待
+ *
+ * @note   SDK 的 hpm_debug_console.c 里对它是【弱定义】(阻塞式轮询 UART),
+ *         链接时由本工程选强定义, printf 于是也走非阻塞路径:
+ *           core0: src/app/app.c —— 串口环形缓冲 + TX 中断;
+ *           core1: core1/src/console_ring.c —— 塞进共享内存日志环, 由 core0 输出
+ *                  (core1 上既没有控制台 UART, 也绝不能在 UART 上死等)。
+ *         这里声明一次, 免得调用方靠隐式声明(返回类型默认 int, 容易埋雷)。
+ */
+int bsp_console_write(const char *data, int size);
 
 /* ---- 便捷宏: LOG_[级别](模块TAG, 格式串, ...) ---- */
 #if APP_LOG_LEVEL <= APP_LOG_LVL_DEBUG

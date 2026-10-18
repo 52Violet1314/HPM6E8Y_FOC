@@ -3,6 +3,13 @@
  *
  * LCD: ILI9341, 320x240, RGB565 over SPI1.
  * Touch: XPT2046-compatible resistive controller over GPIO bit-banged SPI.
+ *
+ * 【双核之后本文件跑在 core1(显示核)上】它和 LCDHw.c/LCDTouch.c/LCDGui.c/lcd_ui.c
+ * 一起, 只在 core1 的镜像里编译(core1/CMakeLists.txt)。所以:
+ *   - 它读的 app_speed_*() 是 core1 侧的"遥测客户端"(core1/src/app_telem_client.c),
+ *     内部从 SHARE_RAM 取 core0 发布的快照 —— 界面代码本身不用为双核做任何改动;
+ *   - 它的 LOG_I 走 core1 的槽位环, 由 core0 的日志任务搬到串口(core1/src/app_log_ring.c);
+ *   - SPI1/HDMA/GPIO 这些外设归 core1 独占, core0 上已经没有它们的使用者。
  */
 #include "board.h"
 #include "hpm_clock_drv.h"
@@ -34,18 +41,23 @@
  * LCD_APP_TEST_CRITICAL_FLUSH: 实验用 —— 把整条 band 的传输包在
  *   taskENTER_CRITICAL()/taskEXIT_CRITICAL() 里(禁止任务切换)。
  *   用来回答"长条是不是任务级抢占造成的"。
- *   【必须知道它的局限】configMAX_SYSCALL_INTERRUPT_PRIORITY = 4, 优先级 1 的
- *   电流环 ADC 中断不受内核临界区影响, 照样会插进来 —— 所以这个实验只能排除
- *   "任务切换", 不能排除"20kHz 电流环中断"。要排除中断, 得临时
- *   intc_m_disable_irq(BOARD_BLDC_ADC_IRQn)(见报告里的实验 2b), 那种改法会让
- *   电流环停跑, 只能在电机静止时做。
- *   【测完必须改回 0】1.3ms 的临界区不能留在正式代码里。 */
+ *   【双核之后这个实验的意义变了】20kHz 电流环 ADC 中断现在跑在 core0 上, 根本
+ *   不会打断 core1 的刷屏; core1 自己的 PLIC 里只有 LCD 像素 DMA 完成中断(6),
+ *   它进来只是给个信号量。所以"长条是电流环中断挤出来的"这条假设, 在双核版本里
+ *   从物理上就不成立了 —— 如果花屏还在, 就只剩 SPI/面板时序和 LVGL area 这两类
+ *   原因可查。这个开关留着只是为了在 core1 上做同样的对照实验(排除 core1 的
+ *   任务切换)。【测完必须改回 0】1.3ms 的临界区不能留在正式代码里。 */
 #define LCD_APP_TRACE_FLUSH           (1)
 #define LCD_APP_TRACE_FLUSH_COUNT     (4U)
 #define LCD_APP_TEST_CRITICAL_FLUSH   (0)
 
+/* LVGL 的 tick 用机器定时器。双核之后取【core1 自己的】mchtmr1:
+ * MCHTMR 是每核独立的实例(地址相同), 用 mchtmr0 会读到 core0 的计数器 ——
+ * 数值虽然一样在走, 但把外设挂在 core1 上语义才是对的(时钟组 1)。
+ * 顺带一提: FreeRTOS 在 core1 上也用 mchtmr1 做 tick(见 core1/rtos/FreeRTOSConfig.h),
+ * 两者只是读同一个计数器, 互不干扰(mtimecmp 是各核独立的)。 */
 #define HPM_LVGL_MCHTMR            HPM_MCHTMR
-#define HPM_LVGL_MCHTMR_CLK        clock_mchtmr0
+#define HPM_LVGL_MCHTMR_CLK        clock_mchtmr1
 
 extern u8 CMD_RDX;
 extern u8 CMD_RDY;
@@ -84,7 +96,7 @@ static uint32_t lcd_tick_cb(void)
     static uint32_t mchtmr_freq_in_khz;
 
     if (mchtmr_freq_in_khz == 0U) {
-        clock_add_to_group(HPM_LVGL_MCHTMR_CLK, 0);
+        clock_add_to_group(HPM_LVGL_MCHTMR_CLK, 1);     /* 组 1 = CPU1(core1) */
         mchtmr_freq_in_khz = clock_get_frequency(HPM_LVGL_MCHTMR_CLK) / 1000U;
     }
 
@@ -192,7 +204,7 @@ void lcd_app_rawtest_bars(void)
     u16 x;
     u16 y;
 
-    printf("[LCD] rawtest: 4 bars (R/G/B/W) -> panel + SPI + color path\r\n");
+    LOG_I("LCD", "rawtest: 4 bars (R/G/B/W) -> panel + SPI + color path");
 
     LCD_SetWindows(0, 0, (u16)(TFT_HOR_RES - 1U), (u16)(TFT_VER_RES - 1U));
     for (y = 0U; y < TFT_VER_RES; y++) {
@@ -212,10 +224,13 @@ void lcd_app_ui_init(void)
      *     buf1 == lv_draw_buf_align(buf1, cf)
      * (lv_display.c:475, buf_align() 内部按 64 向上取整)。
      * 普通 static uint8_t 数组只保证 8/16 字节对齐 -> 断言 "buf1 is not aligned"
-     * 立刻命中; 而 lcd_app_ui_init() 在 main.c 里排在 app_init() 之后、主循环
-     * 之前, 一旦卡死就永远进不了 app_run() -> PWM 停在 50%/50%/50% 零矢量,
-     * 看起来就是"电机驱动不起来"。LV_ATTRIBUTE_MEM_ALIGN 即 lv_conf.h 里的
-     * __attribute__((aligned(64))), 与 LV_DRAW_BUF_ALIGN 保持一致。 */
+     * 立刻命中。LV_ATTRIBUTE_MEM_ALIGN 即 lv_conf.h 里的
+     * __attribute__((aligned(64))), 与 LV_DRAW_BUF_ALIGN 保持一致。
+     *
+     * 【双核之后这里卡住的后果变了】以前它排在 core0 的 app_init() 之后、主循环
+     * 之前, 一旦断言命中就永远进不了 app_run() -> PWM 停在零矢量, 现象是"电机
+     * 驱动不起来"; 现在整个显示初始化都在 core1 上, 卡住只会让屏不亮, 电机照常
+     * 受控 —— core0 那边报的是"core1 阶段 3 之后没动静"(见 core1_boot.c 的心跳检查)。 */
     static uint8_t draw_buffer[TFT_HOR_RES * LVGL_DRAW_BUFFER_LINES * 2U] LV_ATTRIBUTE_MEM_ALIGN;
     lv_display_t *display;
     lv_indev_t *indev;
@@ -244,14 +259,14 @@ void lcd_app_ui_init(void)
 void lcd_app_task_handler(void)
 {
     /* ---- LVGL 串行化 ----
-     * LVGL 不是线程安全的: 谁碰 lv_* 谁就得持有这把锁。目前 [显示任务] 是唯一
-     * 的调用者 (lcd_app_task_handler 在 app_rtos.c 里由显示任务周期调用),
-     * 触摸读取也在 lv_timer_handler() 内部由同一个任务完成 —— 所以现在这把锁
-     * 是"空转"的。留着它是为了将来从别的任务/中断往界面推数据时不会踩内存,
+     * LVGL 不是线程安全的: 谁碰 lv_* 谁就得持有这把锁。目前 core1 上 [显示任务]
+     * 是唯一的调用者 (lcd_app_task_handler 在 core1/rtos/app_rtos.c 里由显示任务
+     * 周期调用), 触摸读取也在 lv_timer_handler() 内部由同一个任务完成 —— 所以现在
+     * 这把锁是"空转"的。留着它是为了将来从别的任务/中断往界面推数据时不会踩内存,
      * 也是把"LVGL 只能有一个线程碰"这条规矩写进代码里。
      *
-     * 【重要】拿不到锁就直接返回, 不要阻塞等待: 本函数跑在最低优先级任务里,
-     * 阻塞也不会抢占控制任务, 但会让刷屏节奏乱掉; 而丢一帧无所谓。
+     * 【重要】拿不到锁就直接返回, 不要阻塞等待: 阻塞只会让刷屏节奏乱掉, 而丢一帧
+     * 无所谓(现在它更不可能影响电机 —— 锁和 lv_* 全在 core1 自己的地址空间里)。
      * 【重要】调度器还没起来时 (上电初始化阶段) 不能调 RTOS API。 */
     if (lcd_app_lvgl_lock() != 0) {
         /* ---- 电机界面数据刷新 ----
@@ -260,7 +275,10 @@ void lcd_app_task_handler(void)
          *
          * 【为什么放在 LVGL 里而不是 app 里】app 层不依赖 LVGL (分层要求),
          * 所以由这里主动去 app 拉数据。拉的都是 app 给的只读快照
-         * (见 app.h 的"跨任务约定"), 不直接读控制任务的内部结构体。 */
+         * (见 app.h 的"跨任务约定"), 不直接读控制任务的内部结构体。
+         * 【双核之后这些 app_speed_* 是 core1 侧的遥测客户端】它们读的是显示任务
+         * 本拍开头 shm_client_pull() 取回的一致快照, 不再是 core0 里的变量 ——
+         * 对界面代码来说完全一样, 见 core1/src/app_telem_client.c。 */
         lcd_ui_refresh(app_speed_get_rpm(),
                        app_speed_get_target(),
                        app_speed_get_target_eff(),
@@ -275,7 +293,7 @@ void lcd_app_task_handler(void)
     }
 
     /* ---- 每 5 秒汇总一行"像素通路"统计(判断到底有没有丢数据) ----
-     * 本任务周期 5ms(见 app_rtos.c) -> 1000 拍 = 5s。
+     * 本任务周期 5ms(见 core1/rtos/app_rtos.c) -> 1000 拍 = 5s。
      * 【这一行是定案用的证据, 不是普通日志】
      *   chunk = 成功写出的 512B 块数;
      *   busy  = spi_transfer 返回 status_spi_master_busy 的次数
@@ -286,7 +304,8 @@ void lcd_app_task_handler(void)
      *   若 busy/tmo/abort 恒为 0, 说明一个字节都没丢, "长条"就必须去查
      *   LVGL 侧(area/render/flush_ready 时序), 见报告的实验 1 结论分支。
      * 【为什么不放在 LCDHw.c】驱动层不打日志; 这里只做一次 vsnprintf + 入队,
-     *   真正的串口写出由日志任务做, 不会拖慢刷屏。 */
+     *   真正的串口写出由 core0 的日志任务做(core1 的日志经共享内存转出去),
+     *   不会拖慢刷屏。 */
     s_stat_tick++;
     if (s_stat_tick >= 1000U) {
         lcd_tx_stats_t st;

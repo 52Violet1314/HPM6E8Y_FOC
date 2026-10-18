@@ -70,8 +70,14 @@
 #define LV_STDARG_INCLUDE       <stdarg.h>
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
-    /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
-    #define LV_MEM_SIZE (256 * 1024U)          /**< [bytes] */
+    /** Size of memory available for `lv_malloc()` in bytes (>= 2kB)
+     *  【本工程修改】256KB -> 64KB(LVGL 上游默认值)。
+     *  这个池是一块静态数组(进 .bss), 双核之后它整个算在 core1 的内存头上:
+     *  256KB 的池会把 core1 那段 176KB 的 AXI_SRAM 撑爆, 链接直接失败(实测)。
+     *  本工程界面只有 "标题/大字/目标值/速度条" 这几个对象, 占用在 8KB 以内,
+     *  64KB 有一个数量级的余量。真要放图片/大量控件再调大, 同时注意
+     *  core1/linker/core1_flash.ld 里 AXI_SRAM 的长度(176KB)。 */
+    #define LV_MEM_SIZE (64 * 1024U)           /**< [bytes] */
 
     /** Size of the memory expand for `lv_malloc()` in bytes */
     #define LV_MEM_POOL_EXPAND_SIZE 0

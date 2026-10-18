@@ -24,7 +24,11 @@ if args and args[0] == '--sdk':
     with_sdk = True
     args = args[1:]
 
-# 工程源码 = 仓库 src/ 下的文件; 默认排除本地化 SDK 里的路径
+# 工程源码 = 仓库内、且不在本地化 SDK 里的文件。
+# 【为什么不再只认 src/】双核之后多了一个"生成文件"也要编:
+#   build/generated/sec_core_img.c (core1 的镜像数组, 由 CMake 的自定义命令生成)。
+# 它在 compile_commands.json 里是 core0 的正常源文件, 但路径里没有 /src/, 只认
+# src/ 的话它永远编不到 -> 链接时报 undefined reference to `sec_core_img`。
 SDK = os.path.normcase(os.path.join(ROOT, 'hpm_sdk_localized_for_hpm6e00YZ'))
 targets = []
 for e in db:
@@ -32,13 +36,12 @@ for e in db:
     if not f.startswith(os.path.normcase(ROOT)):
         continue
     if with_sdk:
-        # --sdk: SDK 里的文件路径不含 /src/, 所以这里不再要求该条件 (靠过滤器收窄)
+        # --sdk: 连 SDK 里的文件一起编 (靠后面的过滤器收窄)
         targets.append(e)
         continue
     if f.startswith(SDK):
         continue
-    if os.path.normcase(os.sep + 'src' + os.sep) in f:
-        targets.append(e)
+    targets.append(e)
 
 filt = args
 if filt:

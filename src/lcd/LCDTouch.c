@@ -154,7 +154,9 @@ int TC_SPIInit(void)
     spi_timing_config_t timing_config;
     spi_format_config_t format_config;
 
-    clock_add_to_group(clock_spi3, 0);
+    /* 触摸现在归 core1(显示核): 硬件 SPI 触摸这条路(当前没用, 实际走的是下面
+     * 的 GPIO 软件 SPI)也把时钟挂到组 1, 免得以后启用时它跟着 core0 的休眠被关掉。 */
+    clock_add_to_group(clock_spi3, 1);
     /* pins init*/
 	TC_GPIOInit_SPI();
     //board_init_spi_pins_with_gpio_as_cs(LCD_SPI);

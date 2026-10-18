@@ -12,7 +12,8 @@
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "task.h"
-#include "app_rtos.h"           /* APP_IRQ_PRIO_LCD_DMA */
+#include "app_rtos.h"           /* APP_IRQ_PRIO_LCD_DMA (core1 的优先级表) */
+#include "app_log.h"            /* LOG_*: core1 没有控制台, 日志走共享内存 -> core0 */
 
 #include "LCDHw.h"
 #include "stdlib.h"
@@ -117,7 +118,10 @@ int LCD_SPIInit(void)
     uint32_t best_error = 0xFFFFFFFFU;
     uint32_t div;
 
-    clock_add_to_group(clock_spi1, 0);
+    /* 时钟组 1 = 挂到 CPU1(core1): 双核之后 LVGL/SPI1 整个跑在 core1 上。
+     * 组的含义是"只要这个 CPU 不进低功耗, 组内外设的时钟就不停", 所以外设归哪个核
+     * 用, 就加到哪个组。board_init_clock() 里已经 clock_connect_group_to_cpu(1, 1)。 */
+    clock_add_to_group(clock_spi1, 1);
     /* pins init*/
 	//board_init_spi_pins_with_gpio_as_cs(LCD_SPI);
 	LCD_GPIOInit();//LCD GPIO初始化
@@ -146,12 +150,12 @@ int LCD_SPIInit(void)
     timing_config.master_config.clk_src_freq_in_hz = src_clk;
     timing_config.master_config.sclk_freq_in_hz = best_sclk;
     if (spi_master_timing_init(LCD_SPI, &timing_config) != status_success) {
-        printf("[LCD] spi_master_timing_init FAIL (src=%u, want=%u)\n", src_clk, best_sclk);
+        LOG_E("LCD", "spi_master_timing_init 失败 (src=%u, want=%u)", src_clk, best_sclk);
         return -1;
     }
     /* 日志里留一行实参: ILI9341 串行写周期最小 100ns(=10MHz), 超太多初始化就会失败 */
-    printf("[LCD] SPI1 src_clk=%u Hz -> sclk=%u Hz (target %u)\n",
-           src_clk, best_sclk, (unsigned)LCD_SPI_SCLK_FREQ);
+    LOG_I("LCD", "SPI1 src_clk=%u Hz -> sclk=%u Hz (target %u)",
+          src_clk, best_sclk, (unsigned)LCD_SPI_SCLK_FREQ);
 
     spi_master_get_default_format_config(&format_config);
     format_config.common_config.data_len_in_bits = LCD_SPI_DATA_LEN_BITS;
@@ -287,7 +291,7 @@ static void lcd_dma_init(void)
         return;
     }
 
-    clock_add_to_group(clock_hdma, 0);      /* board_init_clock() 已加过, 幂等 */
+    clock_add_to_group(clock_hdma, 1);      /* 时钟组 1 = CPU1(core1); board_init_clock() 已把 hdma 加进组 0, 这里再挂到组 1, 幂等 */
     s_lcd_dma_sem = xSemaphoreCreateBinary();
     if (s_lcd_dma_sem == NULL) {
         s_lcd_stats.dma_disabled = 1U;      /* 堆不够: 老老实实轮询写 */

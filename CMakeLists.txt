@@ -69,13 +69,10 @@ sdk_app_src(src/bsp/bsp_spi_bb.c)
 # J11 排针按键 (位置点动; 低有效 + 内部上拉 + 消抖/长按连发)
 sdk_app_src(src/bsp/bsp_button.c)
 
-# ---- LCD/LVGL: migrated from the fullfuncgui board example ----
-sdk_inc(src/lcd)
-sdk_app_src(src/lcd/LCDHw.c)
-sdk_app_src(src/lcd/LCDTouch.c)
-sdk_app_src(src/lcd/LCDGui.c)
-sdk_app_src(src/lcd/lcd_app.c)
-sdk_app_src(src/lcd/lcd_ui.c)
+# ---- LCD/LVGL: 已整体搬到 core1 (见 core1/CMakeLists.txt) ----
+# 这里【故意】不再编译 src/lcd/*: 双核之后显示层归 core1, 同一份源码在哪个核上
+# 编译就决定了它操作的是哪个核的外设(SPI1/HDMA/GPIO)。core0 里再留一份会白白
+# 占 flash, 更要命的是留下"到底哪个核在刷屏"的歧义。
 
 # ---- Hardware: 传感器/驱动器驱动 (纯协议层, 无硬件) ----
 # MT6701 磁编码器帧解析/CRC
@@ -103,9 +100,67 @@ sdk_app_src(src/app/app_motion.c)
 sdk_app_src(src/app/app_enc_lut.c)
 sdk_app_src(src/app/app_nv.c)
 
-# ---- RTOS: 任务划分 (控制 / 日志 / 显示) ----
+# ---- RTOS: 任务划分 (控制 / 日志) ----
 sdk_inc(src/rtos)
 sdk_app_src(src/rtos/app_rtos.c)
+
+# ---- 双核: core1(显示核) 的镜像与协作 ----
+# core1 是一个独立的 CMake 工程(core1/), 走 SDK 的 sec_core_img 构建类型, 但用
+# core1/linker/core1_flash.ld 把它链接到 flash 的 0x80100000 起 1MB —— 也就是
+# 【就地执行(XIP), 不拷进 ILM】: 显示核带 LVGL, 实测 .text+.rodata ≈ 700KB, 装不进
+# 256KB 的 ILM(详见 core1/linker/core1_flash.ld 顶部说明)。构建顺序:
+#   1) 配置并编译 core1  (产物 core1/output/core1.bin, 已按 flash 布局排好)
+#   2) cmake/core1_img2c.py 把它转成 C 数组 sec_core_img[](段 .core1_img)
+#   3) core0 链接时用 --section-start 把这个段钉在 0x80100000, 于是这份镜像就
+#      躺在 core0 的 elf/烧写文件里; 上电后 core0 检查镜像头并释放 core1
+#      (见 src/dualcore/core1_boot.c)。
+# 结果: 仍然是"只烧一个 elf"; core1 的代码不占 core0 的 RAM, 只占 flash。
+set(CORE1_SRC_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/core1)
+set(CORE1_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/core1)
+set(CORE1_IMG_BIN   ${CORE1_BUILD_DIR}/output/core1.bin)
+set(CORE1_IMG_SRC   ${CMAKE_CURRENT_BINARY_DIR}/generated/sec_core_img.c)
+set(CORE1_IMG_BASE  0x80100000)     # 必须与 src/dualcore/core1_boot_info.h 的 CORE1_IMG_BASE 一致
+
+# 依赖: core1 自己的源文件 + 与它共用的显示层 + 共享内存/镜像头 + 链接脚本
+file(GLOB_RECURSE CORE1_DEPS CONFIGURE_DEPENDS
+    ${CORE1_SRC_DIR}/src/*.c  ${CORE1_SRC_DIR}/src/*.h
+    ${CORE1_SRC_DIR}/rtos/*.c ${CORE1_SRC_DIR}/rtos/*.h
+    ${CORE1_SRC_DIR}/linker/*.ld
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lcd/*.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lcd/*.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dualcore/*.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/app/app.h
+)
+list(APPEND CORE1_DEPS ${CORE1_SRC_DIR}/CMakeLists.txt)
+
+set_source_files_properties(${CORE1_IMG_SRC} PROPERTIES GENERATED TRUE)
+add_custom_command(
+    OUTPUT ${CORE1_IMG_SRC}
+    # core1 独立配置(仅首次)+ 编译(独立 build 目录, 不动 core0 的 build.ninja)。
+    # HPM_SDK_BASE 必须显式传: 构建阶段(ninja)继承的是启动 ninja 时的环境,
+    # 不是本文件里 set(ENV{HPM_SDK_BASE} ...) 改的那个进程内环境。
+    COMMAND ${CMAKE_COMMAND} -E env HPM_SDK_BASE=${HPM_SDK_BASE}
+            ${CMAKE_COMMAND}
+            -DSRC=${CORE1_SRC_DIR} -DBUILD=${CORE1_BUILD_DIR}
+            -DGEN=${CMAKE_GENERATOR} -DBOARD=${BOARD}
+            -DCTYPE=${CMAKE_BUILD_TYPE}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/core1_build.cmake
+    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/core1_img2c.py
+            ${CORE1_IMG_BIN} ${CORE1_IMG_SRC} sec_core_img
+    DEPENDS ${CORE1_DEPS}
+    COMMENT "构建 core1(显示核/LVGL) 镜像并生成 sec_core_img.c"
+    VERBATIM
+)
+add_custom_target(core1_image DEPENDS ${CORE1_IMG_SRC})
+add_dependencies(app core1_image)
+
+# 把 core1 的镜像钉在它自己的 flash 地址上(和 core1 的链接地址必须一致!)
+sdk_ld_options(-Wl,--section-start=.core1_img=${CORE1_IMG_BASE})
+sdk_app_src(${CORE1_IMG_SRC})
+
+# ---- 双核: core0 侧的启动与协作 (检查镜像头/释放 core1/遥测/日志转发) ----
+sdk_inc(src/dualcore)
+sdk_app_src(src/dualcore/core1_boot.c)
 
 sdk_app_src(src/main.c)
 generate_ide_projects()

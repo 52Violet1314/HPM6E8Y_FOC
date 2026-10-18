@@ -9,6 +9,11 @@
  *   真正的写出(串口环形缓冲 + USB 提交)由日志任务做。
  *   这样控制任务里不再有 vsnprintf / USB 相关逻辑, 1kHz 节拍更稳。
  *
+ *   【双核之后的额外一件事】core1(显示核)没有控制台, 它的日志写在共享内存的
+ *   槽位环里(见 core1/src/app_log_ring.c)。日志任务顺带负责把那些行搬出来转发
+ *   (core1_log_drain), 以及监控 core1 的心跳(core1_health_check) —— 于是串口上
+ *   看到的是两个核混在一起的完整时间线, 不需要第二个串口。
+ *
  *   队列满 -> 整行丢弃, 绝不阻塞: 日志永远不该拖慢控制。
  *   调度器还没启动(上电初始化早期) -> 直接写后端, 否则早期日志会卡在队列里出不来。
  */
@@ -21,6 +26,7 @@
 #include "queue.h"
 
 #include "app_log.h"
+#include "core1_boot.h"     /* core1_log_drain / core1_health_check */
 
 #define APP_LOG_MAX_BACKENDS   (4)
 #define APP_LOG_LINE_LEN       (256)
@@ -117,17 +123,33 @@ void app_log_write_raw(const char *line)
     app_log_dispatch(line);
 }
 
-/* 日志任务: 从队列取行并写出 (不死循环返回) */
+void app_log_write_direct(const char *line)
+{
+    if (line == NULL) {
+        return;
+    }
+    app_log_call_backends(line);
+}
+
+/* 日志任务: 从队列取行并写出 (不死循环返回)
+ *
+ * 【为什么 xQueueReceive 要带超时】显示核(core1)的日志也归这个任务转发:
+ *   它把日志行写进共享内存的槽位环(见 src/dualcore/shm_core.h), core0 这边
+ *   定期来搬。如果这里用 portMAX_DELAY 死等队列, 没有本地日志时任务就永远躺在
+ *   阻塞态, core1 的日志会一直积在环里出不来(表现出来就是"屏上的日志串口看不到")。
+ *   10ms 的超时既不影响本地日志的实时性(有日志立刻被唤醒), 又保证空转时每 10ms
+ *   去看一眼 core1 那边。 */
 void app_log_task_body(void)
 {
     static char line[APP_LOG_LINE_LEN];
 
     for (;;) {
         if ((s_log_q != NULL) &&
-            (xQueueReceive(s_log_q, line, portMAX_DELAY) == pdTRUE)) {
+            (xQueueReceive(s_log_q, line, pdMS_TO_TICKS(10)) == pdTRUE)) {
             app_log_call_backends(line);
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
+        /* core1 的日志 + 它的心跳检查(内部 1s 节流) */
+        core1_log_drain();
+        core1_health_check();
     }
 }

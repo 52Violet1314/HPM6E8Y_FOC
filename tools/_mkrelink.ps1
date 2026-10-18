@@ -14,7 +14,11 @@ $objs = @(($line -split '\s+') | Where-Object { $_ -like '*.obj' })
 # 否则症状是 undefined reference (明明编过了却链不上)。
 $extra = @(
     'CMakeFiles/app.dir/src/app/app_motion.c.obj',
-    'CMakeFiles/app.dir/src/bsp/bsp_button.c.obj'
+    'CMakeFiles/app.dir/src/bsp/bsp_button.c.obj',
+    'CMakeFiles/app.dir/src/dualcore/core1_boot.c.obj',
+    # 双核: core1 的镜像数组(CMake 自定义命令生成的 C 文件, 在 build/generated/ 下,
+    # 所以 build.ninja 里的 obj 路径是相对路径; 手工链接时必须补进来)
+    'CMakeFiles/app.dir/generated/sec_core_img.c.obj'
 )
 foreach ($e in $extra) {
     $p = Join-Path $B $e
