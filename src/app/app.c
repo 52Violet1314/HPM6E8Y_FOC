@@ -17,6 +17,12 @@
 #include "hpm_uart_drv.h"       /* 控制台 UART 非阻塞发送 (TX FIFO + 中断) */
 #include "board.h"              /* BOARD_CONSOLE_UART_BASE / _IRQ */
 
+/* FreeRTOS: 只为了 app_delay_ms() 里判断"调度器是否已启动"——
+ * 调度器起来之后必须改用 vTaskDelay 让出 CPU, 否则忙等会把日志/显示任务饿死
+ * (详见 app_delay_ms 的注释)。FreeRTOS.h 必须在 task.h 之前。 */
+#include "FreeRTOS.h"
+#include "task.h"
+
 #include "app.h"
 #include "app_diag.h"
 #include "app_log.h"
@@ -210,14 +216,29 @@ static volatile uint32_t s_isr_gap_us;
 /* 主循环实测周期(s), 供角度外推估计电角速度用 */
 static float s_dt_main = 0.001f;
 
-/* 初始化阶段用的粗延时 (mcycle 计时, 不占外设, 不受中断影响) */
+/* 延时: 初始化阶段用 mcycle 忙等; 调度器跑起来之后【必须让出 CPU】
+ *
+ * 【为什么必须区分 —— 实测踩坑】
+ *   延迟自检(app_run 里)会调用 app_init_run_cycles(), 它内部是 app_delay_ms(1)。
+ *   如果这里永远是忙等, 那么控制任务(最高优先级)在整个探测期间 100% 占着 CPU,
+ *   日志任务(优先级 -3)和显示任务(-4)【一次都轮不到】—— 现象是:
+ *   LCD 之后串口一行都不再输出、屏幕也不刷新, 看起来像"卡死", 其实是饿死。
+ *   所以调度器一旦启动就改用 vTaskDelay 主动让出; 初始化早期(还没调度器)
+ *   仍然用忙等, 因为那时 vTaskDelay 不可用。 */
 static void app_delay_ms(uint32_t ms)
 {
-    uint64_t t0 = hpm_csr_get_core_mcycle();
-    uint64_t n  = ((uint64_t)hpm_core_clock * ms) / 1000U;
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        return;
+    }
 
-    while ((hpm_csr_get_core_mcycle() - t0) < n) {
-        /* busy wait */
+    {
+        uint64_t t0 = hpm_csr_get_core_mcycle();
+        uint64_t n  = ((uint64_t)hpm_core_clock * ms) / 1000U;
+
+        while ((hpm_csr_get_core_mcycle() - t0) < n) {
+            /* busy wait */
+        }
     }
 }
 
@@ -1646,8 +1667,27 @@ void app_run(void)
         }
         bsp_pwm_set_duty_uvw(0.5f, 0.5f, 0.5f);
 
-        if (frames >= APP_ADC_ALIVE_MIN_FRAMES) {
-            /* ---- 补做: 零点标定 -> 放开输出 ---- */
+        if (frames < APP_ADC_ALIVE_MIN_FRAMES) {
+            if ((tick % 1000U) == 0U) {
+                LOG_I("ADC", "degraded: 等待电流采样 (frames=%u, 需要 >=%u), 电机保持封锁",
+                      (unsigned)frames, (unsigned)APP_ADC_ALIVE_MIN_FRAMES);
+            }
+            tick++;
+            return;
+        }
+
+        /* ---- 采样已活: 每秒只尝试一次 ----
+         * 【为什么必须限频】标定(忙等) + 极性探测(120ms 忙等) 很重。
+         * 若每个 1ms 控制周期都重试, 最高优先级的控制任务会 100% 占住 CPU,
+         * 日志任务(优先级-3)/显示任务(-4) 永远轮不到 —— 实测现象就是
+         * "串口在 LCD 之后一行都没有、屏幕也不刷新", 看着像卡死, 其实是饿死。 */
+        tick++;
+        if ((tick % 1000U) != 0U) {
+            return;
+        }
+
+        {
+            /* ---- 补做: 零点标定 -> 极性探测 -> 放开输出 ---- */
             uint16_t uo = 0U, vo = 0U;
             const int32_t mid = (int32_t)(65535U / 2U);
             int32_t iu = 0, iv = 0, iw = 0;
@@ -1659,11 +1699,7 @@ void app_run(void)
                   (unsigned)frames, (unsigned)uo, (unsigned)vo, (int)mid);
 
             if ((uo == (uint16_t)mid) && (vo == (uint16_t)mid)) {
-                /* 标定没拿到有效样本: 继续降级, 下一拍再试 */
-                if ((tick % 1000U) == 0U) {
-                    LOG_I("ADC", "degraded: 标定仍无效(offset=mid), 电机保持封锁");
-                }
-                tick++;
+                LOG_I("ADC", "degraded: 标定仍无效(offset=mid), 电机保持封锁, 1s 后重试");
                 return;
             }
 
@@ -1674,58 +1710,56 @@ void app_run(void)
 
             /* ---- 极性自检 (必须在使能电流环之前) ----
              * 延迟自检绕过了 app_init 里的四角度极性自检; 不做这一步就使能,
-             * 实测会因反馈反号把电流推到 2.5A 然后过流锁死。 */
-            {
+             * 实测会因反馈反号把电流推到 2.5A 然后过流锁死。
+             *
+             * 【必须先打开 PWM 输出】探测是靠"给电压 -> 测电流"工作的。
+             * 这一步漏了就是之前的 bug: 输出还关着, 绕组上没有电压,
+             * 测到的电流恒为 0 -> 探测必然失败 -> 然后变成每秒重试的死循环。 */
+            bsp_pwm_enable_output(true);
+            do {
                 uint8_t pr = app_probe_current_polarity((float)bsp_adc_get_vbus_mv() * 0.001f);
 
                 if (pr == 0U) {
-                    /* 测不出来: 保持封锁, 下一拍重试(避免误使能) */
-                    if ((tick % 1000U) == 0U) {
-                        LOG_I("ADC", "degraded: 极性探测未通过, 电机保持封锁");
-                    }
-                    tick++;
-                    return;
+                    LOG_I("ADC", "degraded: 极性探测未通过(电流太小?), 电机保持封锁, 1s 后重试");
+                    break;
                 }
-
-                if ((pr & 0x02U) != 0U) {
-                    s_cur_sign = -1.0f;
-                } else {
-                    s_cur_sign = 1.0f;
-                }
-
-                LOG_I("ADC", "极性自检结果: sign=%d%s",
-                      (int)s_cur_sign,
-                      ((pr & 0x04U) != 0U) ? " (!! 相序镜像, 仅调极性可能不够)" : "");
-
                 if ((pr & 0x04U) != 0U) {
                     /* 相序镜像不是"取反"能修的: 需要改 s_phase_map。
-                     * 这里选择不使能 —— 带着镜像反馈跑电流环必然发散。 */
+                     * 带着镜像反馈跑电流环必然发散。 */
                     LOG_I("ADC", "!! 相序镜像, 保持封锁 (需要调整 s_phase_map 后重新验证)");
-                    tick++;
-                    return;
+                    break;
                 }
-            }
 
-            s_adc_dead = 0U;
+                s_cur_sign = ((pr & 0x02U) != 0U) ? -1.0f : 1.0f;
+                LOG_I("ADC", "极性自检结果: sign=%d", (int)s_cur_sign);
 
-            /* 放开输出并让 20kHz 中断里的闭环接管(与 app_init 正常路径一致) */
-            bsp_pwm_enable_output(true);
-            foc_controller_enable(&s_ctrl, true);
+                /* ---- 全部通过: 使能电流环, 位置环用当前角度原地保持 ---- */
+                s_adc_dead = 0U;
+
+                foc_controller_enable(&s_ctrl, true);
 #if APP_CURRENT_LOOP_IN_ISR
-            s_isr_closed_loop = 1U;
+                s_isr_closed_loop = 1U;
 #endif
 #if APP_MOTION_ENABLE
-            /* 用当前角度作为位置目标(原地保持), 不会一使能就冲 */
-            (void)bsp_mt6701_poll();
-            (void)app_encoder_update(&s_encoder);
-            app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
+                (void)bsp_mt6701_poll();
+                (void)app_encoder_update(&s_encoder);
+                app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
 #endif
-            LOG_I("APP", "delayed bring-up done: 电机已使能(电流环闭环, sign=%d), 位置环原地保持",
-                  (int)s_cur_sign);
-        } else if ((tick % 1000U) == 0U) {
-            LOG_I("ADC", "degraded: 等待电流采样 (frames=%u, 需要 >=%u), 电机保持封锁",
-                  (unsigned)frames, (unsigned)APP_ADC_ALIVE_MIN_FRAMES);
+                LOG_I("APP", "delayed bring-up done: 电机已使能(电流环闭环, sign=%d), 位置环原地保持",
+                      (int)s_cur_sign);
+            } while (0);
+
+            if (s_adc_dead != 0U) {
+                /* 任一步失败: 关控制器、写回零矢量、关输出, 保持封锁等下一次 */
+                foc_controller_enable(&s_ctrl, false);
+                bsp_pwm_set_duty_uvw(0.5f, 0.5f, 0.5f);
+                bsp_pwm_enable_output(false);
+            }
         }
+
+        /* 【必须在所有路径上自增】下面的 1 秒门槛靠 tick 推进;
+         * 漏掉任何一条 return 路径都会让 tick 停住 -> 每秒门槛失效 -> 又变成
+         * 每个 1ms 周期都重试 -> 控制任务占满 CPU 把日志/显示任务饿死。 */
         tick++;
         return;
     }
