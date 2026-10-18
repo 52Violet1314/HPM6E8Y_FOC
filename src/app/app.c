@@ -263,6 +263,92 @@ static void app_init_run_cycles(uint32_t n, float vbus)
 /* 闭环过流保护标志: 一旦触发就永久关断输出, 必须复位重跑才恢复 */
 static uint8_t s_oc_tripped;
 
+/* ================= 延迟自检专用: 相电流极性/相序探测 =================
+ *
+ * 【为什么需要它】延迟自检这条路绕过了 app_init 里那段"四角度极性自检",
+ * 导致 s_cur_sign 停在默认 +1。实测后果:
+ *     延迟自检完成后立刻
+ *     OVERCURRENT 2563mA (ia=2563 ib=-662 ic=-1901) id=-1478 iq=2212 sign=1
+ * 也就是电流环拿到的是【反号】反馈 -> PI 一路顶到限幅 -> 真实电流冲到 2.5A ->
+ * 过流保护锁死。所以必须在使能电流环之前, 用【真实可用的 ADC】把极性测出来。
+ *
+ * 【判据】开环给一个固定电压矢量, 在电角度 0° 和 90° 各钉一次, 读三相电流:
+ *   角度 0° : 施加的矢量在 +alpha 方向 -> 实测 alpha 分量为正 = 极性正
+ *   角度 90°: 施加的矢量在 +beta  方向 -> 实测 beta 分量为正 = 相序不镜像
+ * 两者合起来既能定极性(整体取反), 也能发现 V/W 互换(镜像)。
+ *
+ * 【安全性】电压只用 APP_ADC_PROBE_V(0.5V), 电流约 V/R ≈ 2A, 每次只保持
+ * 60ms; 测完立刻关控制器、写零矢量。失败(电流太小无法判断)时返回 0,
+ * 调用者必须保持电机封锁 —— 绝不在"没测出极性"的情况下使能电流环。
+ *
+ * @return bit0 = 成功, bit1 = 极性反(需要 s_cur_sign = -1), bit2 = 相序镜像
+ *         0 = 失败/无法判断 */
+uint8_t app_probe_current_polarity(float vbus)
+{
+    static const float ang[2] = {0.0f, 1.5707963f};
+    float va[2];        /* 每个角度测到的 alpha 分量 (mA) */
+    float vb[2];        /* 每个角度测到的 beta  分量 (mA) */
+    uint8_t k;
+
+    s_ctrl.openloop.voltage_slew = 100.0f;      /* 默认 1V/s 太慢, 这里快速到位 */
+    foc_controller_set_mode(&s_ctrl, foc_ctrl_mode_openloop);
+    foc_controller_set_voltage(&s_ctrl, APP_ADC_PROBE_V);
+    foc_controller_enable(&s_ctrl, true);
+
+    for (k = 0U; k < 2U; k++) {
+        uint32_t i;
+        float    sa = 0.0f, sb = 0.0f, sc = 0.0f;
+
+        foc_controller_set_align_angle(&s_ctrl, ang[k]);
+
+        for (i = 0U; i < 60U; i++) {
+            int32_t ia = 0, ib = 0, ic = 0;
+
+            app_init_run_cycles(1U, vbus);
+
+            /* 只统计后半段(前半段在爬电压/建立电流) */
+            if (i >= 40U) {
+                bsp_adc_get_currents_ma(&ia, &ib, &ic);
+                sa += (float)ia;
+                sb += (float)ib;
+                sc += (float)ic;
+            }
+        }
+        sa /= 20.0f; sb /= 20.0f; sc /= 20.0f;
+
+        va[k] = sa;                                  /* Clarke: alpha = ia */
+        vb[k] = (sb - sc) * 0.57735f;                /* beta = (ib - ic)/sqrt(3) */
+    }
+
+    foc_controller_enable(&s_ctrl, false);
+    bsp_pwm_set_duty_uvw(0.5f, 0.5f, 0.5f);
+    s_ctrl.openloop.voltage_slew = FOC_OPENLOOP_VOLTAGE_SLEW;
+    foc_controller_set_mode(&s_ctrl, foc_ctrl_mode_current);
+
+    LOG_I("ADC", "polarity probe: 0deg a=%d b=%d mA, 90deg a=%d b=%d mA",
+          (int)va[0], (int)vb[0], (int)va[1], (int)vb[1]);
+
+    /* 幅值门限: 0.5V / 约 0.25Ω ≈ 2A, 实测几百 mA 以上才可信 */
+    if ((va[0] > -APP_ADC_PROBE_MIN_MA) && (va[0] < APP_ADC_PROBE_MIN_MA)) {
+        LOG_I("ADC", "!! polarity probe 失败: 0deg 的 alpha 分量只有 %d mA (需 >%d),"
+                     " 无法判断极性 -> 保持封锁", (int)va[0], (int)APP_ADC_PROBE_MIN_MA);
+        return 0U;
+    }
+
+    {
+        uint8_t res = 0x01U;                        /* bit0 = 成功 */
+
+        if (va[0] < 0.0f) {
+            res |= 0x02U;                           /* 极性反 */
+        }
+        /* 极性归一化后, 90° 处 beta 应为正; 为负说明相序镜像 */
+        if ((vb[1] * ((va[0] < 0.0f) ? -1.0f : 1.0f)) < 0.0f) {
+            res |= 0x04U;                           /* 相序镜像 */
+        }
+        return res;
+    }
+}
+
 /* 只用比较实现, 避免依赖 math.h / libm */
 static float app_abs_f(float v)
 {
@@ -1586,6 +1672,40 @@ void app_run(void)
             LOG_I("ADC", "readback @0vector: ia=%d ib=%d ic=%d mA (应接近 0)",
                   (int)iu, (int)iv, (int)iw);
 
+            /* ---- 极性自检 (必须在使能电流环之前) ----
+             * 延迟自检绕过了 app_init 里的四角度极性自检; 不做这一步就使能,
+             * 实测会因反馈反号把电流推到 2.5A 然后过流锁死。 */
+            {
+                uint8_t pr = app_probe_current_polarity((float)bsp_adc_get_vbus_mv() * 0.001f);
+
+                if (pr == 0U) {
+                    /* 测不出来: 保持封锁, 下一拍重试(避免误使能) */
+                    if ((tick % 1000U) == 0U) {
+                        LOG_I("ADC", "degraded: 极性探测未通过, 电机保持封锁");
+                    }
+                    tick++;
+                    return;
+                }
+
+                if ((pr & 0x02U) != 0U) {
+                    s_cur_sign = -1.0f;
+                } else {
+                    s_cur_sign = 1.0f;
+                }
+
+                LOG_I("ADC", "极性自检结果: sign=%d%s",
+                      (int)s_cur_sign,
+                      ((pr & 0x04U) != 0U) ? " (!! 相序镜像, 仅调极性可能不够)" : "");
+
+                if ((pr & 0x04U) != 0U) {
+                    /* 相序镜像不是"取反"能修的: 需要改 s_phase_map。
+                     * 这里选择不使能 —— 带着镜像反馈跑电流环必然发散。 */
+                    LOG_I("ADC", "!! 相序镜像, 保持封锁 (需要调整 s_phase_map 后重新验证)");
+                    tick++;
+                    return;
+                }
+            }
+
             s_adc_dead = 0U;
 
             /* 放开输出并让 20kHz 中断里的闭环接管(与 app_init 正常路径一致) */
@@ -1600,7 +1720,8 @@ void app_run(void)
             (void)app_encoder_update(&s_encoder);
             app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
 #endif
-            LOG_I("APP", "delayed bring-up done: 电机已使能(电流环闭环), 位置环原地保持");
+            LOG_I("APP", "delayed bring-up done: 电机已使能(电流环闭环, sign=%d), 位置环原地保持",
+                  (int)s_cur_sign);
         } else if ((tick % 1000U) == 0U) {
             LOG_I("ADC", "degraded: 等待电流采样 (frames=%u, 需要 >=%u), 电机保持封锁",
                   (unsigned)frames, (unsigned)APP_ADC_ALIVE_MIN_FRAMES);

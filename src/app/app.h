@@ -451,6 +451,15 @@ extern "C" {
 #define APP_ADC_ALIVE_WAIT_MS       (300U)
 #define APP_ADC_ALIVE_MIN_FRAMES    (10U)
 
+/* ---- 延迟自检里的"相电流极性探测"(见 app.c 的 app_probe_current_polarity) ----
+ * 延迟自检绕过了 app_init 里那段四角度极性自检, 而实测缺了它就会:
+ *   使能电流环 -> 反馈反号 -> PI 顶限幅 -> 真实电流 2.5A -> 过流锁死。
+ * 所以这里用开环小电压在 0°/90° 各钉一次, 用真实可用的 ADC 定出极性。
+ *   APP_ADC_PROBE_V      : 探测电压 (V)。0.5V / 约0.25Ω ≈ 2A, 只保持 60ms
+ *   APP_ADC_PROBE_MIN_MA : 判据幅值门限 (mA)。低于它认为"测不出来", 保持封锁 */
+#define APP_ADC_PROBE_V             (0.5f)
+#define APP_ADC_PROBE_MIN_MA        (300)
+
 /* 相电流极性: 低边采样电阻测到的电流方向取决于运放接法, 弄反了电流环必发散。
  *   0    = 上电自检自动判定 (默认, 见下面 APP_CURRENT_SIGN_AUTOTEST)
  *   +1/-1 = 强制指定, 不做自检 */
