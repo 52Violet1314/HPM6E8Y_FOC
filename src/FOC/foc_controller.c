@@ -13,7 +13,7 @@ void foc_controller_init(foc_controller_t *ctrl, float ts)
         return;
     }
 
-    ctrl->mode = foc_ctrl_mode_openloop;
+    ctrl->mode = foc_ctrl_mode_current;
     ctrl->duty_u = 0.5f;
     ctrl->duty_v = 0.5f;
     ctrl->duty_w = 0.5f;

@@ -41,6 +41,16 @@ void bsp_adc_init(void);
 bool bsp_adc_current_ready(void);
 
 /**
+ * @brief  取"ADC 采样完成"的累计帧数 (只在 ADC 中断里自增)
+ * @return 帧计数
+ * @note   【用途】判断电流采样通路到底活没活。这个数不涨 = ADC 没有在转换,
+ *         此时 bsp_adc_get_currents_ma() 返回的仍是上一帧(或初始的 0/32767),
+ *         电流环拿它闭环必然跑飞。
+ *         【预期速率】= PWM 载波频率 (20kHz), 即每毫秒约 20 帧。
+ */
+uint32_t bsp_adc_get_frame_count(void);
+
+/**
  * @brief  读取相电流原始码值 (16bit)
  * @param  iu,iv,iw  输出指针, 可传 NULL; iw 由 iu/iv 反推得到
  */

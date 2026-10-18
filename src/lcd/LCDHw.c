@@ -379,10 +379,19 @@ static hpm_stat_t lcd_dma_write_block(const u8 *buff, u32 len)
         return status_fail;
     }
 
-    /* 3) 兜底 cache 维护(缓冲区已在 noncacheable 段, 这里是双保险) */
-    if (l1c_dc_is_enabled()) {
-        l1c_dc_writeback((u32)buff, len);
-    }
+    /* 3) 缓冲区在 AXI_SRAM_NONCACHEABLE 段, CPU 写它【不经过 D-Cache】,
+     *    所以【不能】在这里调 l1c_dc_writeback():
+     *      - 语义上没有必要(那段本来就 non-cacheable);
+     *      - 更致命的是 l1c_dc_writeback() 内部有
+     *            ASSERT_ADDR_SIZE: addr 和 size 都必须是 HPM_L1C_CACHELINE_SIZE 的整数倍
+     *        而这里 len 是 512 或更零碎的字节数(比如一次 flush 只有几十字节),
+     *        于是【每次刷屏都会触发 assert 并使系统停在那里】——
+     *        实测日志里那条
+     *          assertion "size % HPM_L1C_CACHELINE_SIZE == 0" failed
+     *            file hpm_l1c_drv.c line 111 function l1c_dc_writeback
+     *        就是它。
+     *    将来若把缓冲改回可缓存段, 必须自己按 cacheline 向上对齐后再 writeback/
+     *    invalidate, 不能直接把任意 len 丢给驱动。 */
 
     /* 4) 配好并启动 DMA 通道(此刻 SPI 还没发请求, 不会丢数据)。
      *    dst_fixed = true 同时意味着 dst_mode = HANDSHAKE: 由 SPI 的 TX 请求

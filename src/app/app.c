@@ -742,6 +742,55 @@ void app_init(void)
     bsp_pwm_set_duty_uvw(0.5f, 0.5f, 0.5f);      /* 零矢量 */
     bsp_pwm_enable_output(true);                 /* 打开输出 (零矢量下相电流仍为 0) */
     diag_set_stage(APP_STAGE_PWM_ENABLE);
+
+    /* ================= ADC 存活门槛 (必须在标定/自检之前) =================
+     *
+     * 【为什么加这道门】实测踩过一次非常隐蔽的坑:
+     *   PWM 计数器已启动、ADC 中断也使能了, 但【ADC 一帧都没采到】。
+     *   此时 s_cur_u_raw 还是 0, 而零点 s_cur_u_offset 是 32767, 于是
+     *   bsp_adc_get_currents_ma() 算出的是 **满量程负电流** (-16499mA)。
+     *   后果:
+     *     - 零点标定拿到的是 (0-32767), 记进 offset 后整个电流反馈永久偏掉;
+     *     - 电流传感自检在"量程值"上打分 -> score=0 却仍然选出 sign=-1/map=0/1/2;
+     *     - 电流环拿着假反馈积分 -> iq 顶限幅、uq 顶限幅、电机被盲推着转/抖。
+     *   之前排查"为什么电机自己转/震荡"绕了很多圈, 根子就在这里:
+     *   **电流环从头到尾都没有可信反馈, 却一直在闭环运行。**
+     *
+     * 【怎么判定"活着"】看 bsp_adc_get_frame_count(): 它只在 ADC 中断里自增。
+     * 给 PWM/ADC 一点时间(实测 <20ms 就应该有几百帧), 等不到就判死。
+     * 【判死之后怎么办】绝不能让电机继续跑 —— 封锁输出、进入死循环并持续打印,
+     *   而不是"假装没事往下走"。没有电流反馈的 FOC 是纯粹的危险动作。 */
+    {
+        uint32_t wait_ms;
+        uint32_t frames = 0U;
+
+        for (wait_ms = 0U; wait_ms < APP_ADC_ALIVE_WAIT_MS; wait_ms++) {
+            frames = bsp_adc_get_frame_count();
+
+            if (frames >= APP_ADC_ALIVE_MIN_FRAMES) {
+                break;
+            }
+            app_delay_ms(1U);
+        }
+
+        if (frames < APP_ADC_ALIVE_MIN_FRAMES) {
+            foc_controller_enable(&s_ctrl, false);
+            bsp_pwm_enable_output(false);
+
+            while (1) {
+                LOG_I("ADC", "!! FATAL: ADC 相电流一帧都没采到 (frames=%u, 等了 %ums)。"
+                             "电流环没有反馈, 已封锁输出。检查: ADC 时钟/触发(TRGM)/"
+                             "DMA 缓冲/采样电阻供电。",
+                      (unsigned)frames, (unsigned)APP_ADC_ALIVE_WAIT_MS);
+                app_delay_ms(500U);
+            }
+        }
+
+        LOG_I("ADC", "alive: %u frames in <=%ums (%.1f kHz)",
+              (unsigned)frames, (unsigned)APP_ADC_ALIVE_WAIT_MS,
+              (float)frames / ((float)APP_ADC_ALIVE_WAIT_MS * 0.001f) / 1000.0f);
+    }
+
 #if APP_ADC_OFFSET_CAL_ENABLE
     bsp_adc_calibrate();                         /* 等 256 个新样本求平均 (约 12.8ms @20kHz) */
 #endif
@@ -756,6 +805,19 @@ void app_init(void)
         LOG_I("ADC", "offset error: u=%d mA v=%d mA",
               (int)bsp_adc_counts_to_ma((int32_t)uo - mid),
               (int)bsp_adc_counts_to_ma((int32_t)vo - mid));
+
+        /* 【再判一次】零点必须离中点不远。若 offset 恰好等于 32767(默认值)且
+         * 标定期间一帧新数据都没有, 说明 calibrate() 提前退出了——
+         * 那时 offset 是"猜"的, 不能拿去闭环。 */
+        if (((int32_t)uo == mid) && ((int32_t)vo == mid) &&
+            (bsp_adc_get_frame_count() < APP_ADC_ALIVE_MIN_FRAMES)) {
+            foc_controller_enable(&s_ctrl, false);
+            bsp_pwm_enable_output(false);
+            LOG_I("ADC", "!! FATAL: 零点标定没有拿到有效样本, 电流反馈不可信 -> 封锁输出");
+            while (1) {
+                app_delay_ms(500U);
+            }
+        }
     }
 
     /* ================= 第二步: 电流传感自检 (可选, 但闭环必须做) =================

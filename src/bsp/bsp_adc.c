@@ -323,6 +323,12 @@ bool bsp_adc_current_ready(void)
     return s_cur_ready;
 }
 
+uint32_t bsp_adc_get_frame_count(void)
+{
+    /* 只在 ADC 中断里自增; 32 位读在 RV32 上是原子的, 不需要加锁 */
+    return s_cur_frame;
+}
+
 /**
  * @brief  读取三相电流原始码值
  * @param  iu,iv,iw  输出指针, 可传 NULL 表示不需要该相

@@ -429,6 +429,22 @@ extern "C" {
  *   0 = 用理论中点 65535/2 当零点 (不校准)。 */
 #define APP_ADC_OFFSET_CAL_ENABLE   (1)
 
+/* ---- ADC 相电流存活门槛 (上电自检最前面, 不可关) ----
+ *
+ * 【为什么必须有】实测踩过一次: PWM 在跑、ADC 中断也使能, 但 ADC 一帧都没采到。
+ * 这时 s_cur_u_raw 还是 0 而零点 offset 是 32767, bsp_adc_get_currents_ma()
+ * 算出来就是【满量程负电流】(-16499mA)。后果:
+ *    - 零点标定被污染;  电流传感自检在量程值上打分(score=0)却仍然选出 sign=-1;
+ *    - 电流环拿着假反馈积分 -> iq/uq 双双顶限幅 -> 电机被盲推着转、抖、震荡。
+ * 之前排查"电机自己转/震荡"绕了很多圈, 根子就在这: 电流环从来没有可信反馈。
+ *
+ * 所以上电后先等 ADC 帧计数涨起来, 等不到就【封锁输出并停机报警】——
+ * 没有电流反馈的 FOC 不允许运行。
+ *   APP_ADC_ALIVE_WAIT_MS   : 最多等多久(实测 20ms 内就有几百帧)
+ *   APP_ADC_ALIVE_MIN_FRAMES: 至少这么多帧才算"活" (10 帧 = 500us @20kHz) */
+#define APP_ADC_ALIVE_WAIT_MS       (200U)
+#define APP_ADC_ALIVE_MIN_FRAMES    (10U)
+
 /* 相电流极性: 低边采样电阻测到的电流方向取决于运放接法, 弄反了电流环必发散。
  *   0    = 上电自检自动判定 (默认, 见下面 APP_CURRENT_SIGN_AUTOTEST)
  *   +1/-1 = 强制指定, 不做自检 */
