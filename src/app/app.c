@@ -1540,20 +1540,70 @@ void app_run(void)
     diag_set_stage(APP_STAGE_LOOP_TOP);
     diag_tick();
 
-    /* ---- 降级模式: 电流采样不可用时, 只做只读诊断, 绝不闭环 ----
-     * app_init() 已经在 s_adc_dead 置位时封锁了 PWM 输出并跳过使能, 这里再兜一层:
-     * 万一有别的地方把 s_ctrl.enabled 打开了, 也强制关掉, 并让控制量归零。
-     * 这样即使电流采样坏了, 电机也不可能出力(绕组上没有电压矢量)。 */
+    /* ---- ADC 未就绪: 只做诊断, 但【持续观察】, 一旦活过来就补做自检 ----
+     *
+     * 【为什么不能在这里永久放弃】实测: app_init 里等 200ms/3000ms 都是 frames=0,
+     * 而 app_init 一返回 frames 立刻开始涨(3 -> 19943/秒, 正好 20kHz)。
+     * 也就是说 ADC 的出帧发生在 app_init 之后 —— 在 app_init 里死等永远等不到。
+     * 所以改成"延迟自检": 这里每秒看一次帧计数, 涨到门槛就补做零点标定,
+     * 然后才放开电机。在这之前电机一直是封锁的(不出力)。
+     *
+     * 【安全边界】没通过标定之前绝不使能; 标定通过后也只放开输出,
+     * 电流环的参数/方向仍然沿用 app.h 里的配置。 */
     if (s_adc_dead != 0U) {
+        uint32_t frames = bsp_adc_get_frame_count();
+
+        /* 已经使能了就强制关掉(兜底) */
         if (s_ctrl.enabled) {
             foc_controller_enable(&s_ctrl, false);
             bsp_pwm_enable_output(false);
         }
         bsp_pwm_set_duty_uvw(0.5f, 0.5f, 0.5f);
 
-        if ((tick % 1000U) == 0U) {
-            LOG_I("ADC", "degraded: 电流采样不可用, 电机保持封锁 (frames=%u)",
-                  (unsigned)bsp_adc_get_frame_count());
+        if (frames >= APP_ADC_ALIVE_MIN_FRAMES) {
+            /* ---- 补做: 零点标定 -> 放开输出 ---- */
+            uint16_t uo = 0U, vo = 0U;
+            const int32_t mid = (int32_t)(65535U / 2U);
+            int32_t iu = 0, iv = 0, iw = 0;
+
+            bsp_adc_calibrate();
+            bsp_adc_get_offsets(&uo, &vo);
+
+            LOG_I("ADC", "!! 延迟自检: 采样已就绪(frames=%u), 补做零点标定 u=%u v=%u (mid=%d)",
+                  (unsigned)frames, (unsigned)uo, (unsigned)vo, (int)mid);
+
+            if ((uo == (uint16_t)mid) && (vo == (uint16_t)mid)) {
+                /* 标定没拿到有效样本: 继续降级, 下一拍再试 */
+                if ((tick % 1000U) == 0U) {
+                    LOG_I("ADC", "degraded: 标定仍无效(offset=mid), 电机保持封锁");
+                }
+                tick++;
+                return;
+            }
+
+            /* 标定有效: 打印一次实际电流读数(此时是零矢量, 应接近 0mA) */
+            bsp_adc_get_currents_ma(&iu, &iv, &iw);
+            LOG_I("ADC", "readback @0vector: ia=%d ib=%d ic=%d mA (应接近 0)",
+                  (int)iu, (int)iv, (int)iw);
+
+            s_adc_dead = 0U;
+
+            /* 放开输出并让 20kHz 中断里的闭环接管(与 app_init 正常路径一致) */
+            bsp_pwm_enable_output(true);
+            foc_controller_enable(&s_ctrl, true);
+#if APP_CURRENT_LOOP_IN_ISR
+            s_isr_closed_loop = 1U;
+#endif
+#if APP_MOTION_ENABLE
+            /* 用当前角度作为位置目标(原地保持), 不会一使能就冲 */
+            (void)bsp_mt6701_poll();
+            (void)app_encoder_update(&s_encoder);
+            app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
+#endif
+            LOG_I("APP", "delayed bring-up done: 电机已使能(电流环闭环), 位置环原地保持");
+        } else if ((tick % 1000U) == 0U) {
+            LOG_I("ADC", "degraded: 等待电流采样 (frames=%u, 需要 >=%u), 电机保持封锁",
+                  (unsigned)frames, (unsigned)APP_ADC_ALIVE_MIN_FRAMES);
         }
         tick++;
         return;
