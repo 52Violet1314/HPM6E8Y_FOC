@@ -64,6 +64,12 @@ static volatile float s_speed_target_rpm = APP_SPEED_TARGET_DEFAULT_RPM;
  * 不想自检就把它固定成 APP_SPEED_DIR_SIGN (app.h)。 */
 static float s_speed_dir = APP_SPEED_DIR_SIGN;
 
+/* ---- ADC 相电流通路失效标志 (只在上电自检里置位, 之后一直为 1) ----
+ * 置位含义: 电流采样没有可信数据。此时【任何闭环都不允许运行】,
+ * 但系统仍然继续跑(日志/屏幕/诊断都活着), 而不是死循环卡住 ——
+ * 见 app_init 里"ADC 存活门槛"的说明。 */
+static uint8_t s_adc_dead;
+
 /* ---- 位置环状态快照 (RTOS 下显示/其它任务只能读这些, 不能碰 s_motion) ---- */
 #if APP_MOTION_ENABLE
 static volatile uint8_t s_motion_running;    /* 1 = 位置环在跑 */
@@ -758,8 +764,16 @@ void app_init(void)
      *
      * 【怎么判定"活着"】看 bsp_adc_get_frame_count(): 它只在 ADC 中断里自增。
      * 给 PWM/ADC 一点时间(实测 <20ms 就应该有几百帧), 等不到就判死。
-     * 【判死之后怎么办】绝不能让电机继续跑 —— 封锁输出、进入死循环并持续打印,
-     *   而不是"假装没事往下走"。没有电流反馈的 FOC 是纯粹的危险动作。 */
+     *
+     * 【判死之后怎么办 —— 这里曾经写错过】
+     *   第一版是"封锁输出 + while(1) 死循环打印"。这是个坏设计:
+     *   板子会永久卡在 app_delay_ms() 的 mcycle 忙等里, 串口只剩一行重复,
+     *   屏幕不再刷新、日志任务也不再跑 —— 看上去就是"程序卡死在
+     *   hpm_csr_get_core_mcycle()", 既没法继续调试, 也没法判断是软件还是硬件。
+     *   现在改成【降级运行】: 封锁 PWM 输出、跳过下面所有自检/标定、把电机
+     *   永久保持在未使能状态, 但 app_init 正常返回、app_run 继续跑循环 ——
+     *   串口能持续输出状态, 屏幕照常刷新, 你能看到"到底是什么坏了"。
+     *   电流环没有可信反馈时, 电机唯一该处的状态就是"不出力"。 */
     {
         uint32_t wait_ms;
         uint32_t frames = 0U;
@@ -774,21 +788,29 @@ void app_init(void)
         }
 
         if (frames < APP_ADC_ALIVE_MIN_FRAMES) {
+            /* 没有电流反馈: 永远不许使能电机 */
             foc_controller_enable(&s_ctrl, false);
             bsp_pwm_enable_output(false);
+            s_adc_dead = 1U;
 
-            while (1) {
-                LOG_I("ADC", "!! FATAL: ADC 相电流一帧都没采到 (frames=%u, 等了 %ums)。"
-                             "电流环没有反馈, 已封锁输出。检查: ADC 时钟/触发(TRGM)/"
-                             "DMA 缓冲/采样电阻供电。",
-                      (unsigned)frames, (unsigned)APP_ADC_ALIVE_WAIT_MS);
-                app_delay_ms(500U);
-            }
+            LOG_I("ADC", "!! ADC 相电流一帧都没采到 (frames=%u, 等了 %ums) -> "
+                         "封锁输出并跳过全部自检, 电机保持不出力。"
+                         "请检查: ADC 时钟 / TRGM 触发(PWM0 TRGO) / DMA 缓冲 / 采样电阻供电。",
+                  (unsigned)frames, (unsigned)APP_ADC_ALIVE_WAIT_MS);
+        } else {
+            LOG_I("ADC", "alive: %u frames in <=%ums (%.1f kHz)",
+                  (unsigned)frames, (unsigned)APP_ADC_ALIVE_WAIT_MS,
+                  (float)frames / ((float)APP_ADC_ALIVE_WAIT_MS * 0.001f) / 1000.0f);
         }
+    }
 
-        LOG_I("ADC", "alive: %u frames in <=%ums (%.1f kHz)",
-              (unsigned)frames, (unsigned)APP_ADC_ALIVE_WAIT_MS,
-              (float)frames / ((float)APP_ADC_ALIVE_WAIT_MS * 0.001f) / 1000.0f);
+    /* ADC 没活过来: 跳过零点标定/极性自检/使能, 直接返回。
+     * app_run() 里还有一道 s_adc_dead 检查会把闭环彻底挡住。 */
+    if (s_adc_dead != 0U) {
+        LOG_I("APP", "degraded mode: 电流采样不可用, 本次上电只做诊断, 电机不会转动");
+        LOG_I("PWM", "reload=%u, freq=%u Hz (output OFF)",
+              (unsigned)bsp_pwm_get_reload(), (unsigned)BSP_PWM_FREQUENCY_HZ);
+        return;
     }
 
 #if APP_ADC_OFFSET_CAL_ENABLE
@@ -808,15 +830,14 @@ void app_init(void)
 
         /* 【再判一次】零点必须离中点不远。若 offset 恰好等于 32767(默认值)且
          * 标定期间一帧新数据都没有, 说明 calibrate() 提前退出了——
-         * 那时 offset 是"猜"的, 不能拿去闭环。 */
+         * 那时 offset 是"猜"的, 不能拿去闭环。同样降级, 不死循环。 */
         if (((int32_t)uo == mid) && ((int32_t)vo == mid) &&
             (bsp_adc_get_frame_count() < APP_ADC_ALIVE_MIN_FRAMES)) {
             foc_controller_enable(&s_ctrl, false);
             bsp_pwm_enable_output(false);
-            LOG_I("ADC", "!! FATAL: 零点标定没有拿到有效样本, 电流反馈不可信 -> 封锁输出");
-            while (1) {
-                app_delay_ms(500U);
-            }
+            s_adc_dead = 1U;
+            LOG_I("ADC", "!! 零点标定没拿到有效样本, 电流反馈不可信 -> 封锁输出, 电机不出力");
+            return;
         }
     }
 
@@ -1518,6 +1539,25 @@ void app_run(void)
 
     diag_set_stage(APP_STAGE_LOOP_TOP);
     diag_tick();
+
+    /* ---- 降级模式: 电流采样不可用时, 只做只读诊断, 绝不闭环 ----
+     * app_init() 已经在 s_adc_dead 置位时封锁了 PWM 输出并跳过使能, 这里再兜一层:
+     * 万一有别的地方把 s_ctrl.enabled 打开了, 也强制关掉, 并让控制量归零。
+     * 这样即使电流采样坏了, 电机也不可能出力(绕组上没有电压矢量)。 */
+    if (s_adc_dead != 0U) {
+        if (s_ctrl.enabled) {
+            foc_controller_enable(&s_ctrl, false);
+            bsp_pwm_enable_output(false);
+        }
+        bsp_pwm_set_duty_uvw(0.5f, 0.5f, 0.5f);
+
+        if ((tick % 1000U) == 0U) {
+            LOG_I("ADC", "degraded: 电流采样不可用, 电机保持封锁 (frames=%u)",
+                  (unsigned)bsp_adc_get_frame_count());
+        }
+        tick++;
+        return;
+    }
 
     /* ---- 采集: 编码器 / 电流 / 母线电压 ---- */
     /* MT6701 走 SPI, 没有硬件周期触发, 由控制周期主动读一帧 (1kHz) */
