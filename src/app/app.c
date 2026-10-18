@@ -322,12 +322,14 @@ uint8_t app_probe_current_polarity(float vbus)
 
         foc_controller_set_align_angle(&s_ctrl, ang[k]);
 
-        for (i = 0U; i < 60U; i++) {
+        for (i = 0U; i < 80U; i++) {
             int32_t ia = 0, ib = 0, ic = 0;
 
             app_init_run_cycles(1U, vbus);
 
-            /* 只统计后半段(前半段在爬电压/建立电流) */
+            /* 只统计后半段(前半段在爬电压/建立电流)。
+             * 【40 拍 = 40ms】实测 0.5V 时信号只有 140mA 而噪声可达 80mA,
+             * 平均窗口太短会判错; 加长到 40 拍把噪声压下去(见 app.h 的说明)。 */
             if (i >= 40U) {
                 bsp_adc_get_currents_ma(&ia, &ib, &ic);
                 sa += (float)ia;
@@ -335,7 +337,7 @@ uint8_t app_probe_current_polarity(float vbus)
                 sc += (float)ic;
             }
         }
-        sa /= 20.0f; sb /= 20.0f; sc /= 20.0f;
+        sa /= 40.0f; sb /= 40.0f; sc /= 40.0f;
 
         va[k] = sa;                                  /* Clarke: alpha = ia */
         vb[k] = (sb - sc) * 0.57735f;                /* beta = (ib - ic)/sqrt(3) */
