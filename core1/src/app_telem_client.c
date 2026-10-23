@@ -67,3 +67,25 @@ uint8_t app_speed_is_calibrating(void)
 {
     return ((shm_client_telem()->status & SHM_STATUS_CALIBRATING) != 0U) ? 1U : 0U;
 }
+
+/* ---- 位置环开关 (屏幕上的那个 switch) ----
+ * core1 只能"发命令", 真正的使能位在 core0 的 s_motion.enable 里。
+ * 所以这里做成: 写 = 发命令(cmd_motion), 读 = 看 core0 回报的状态位。 */
+void app_motion_set_enable(uint8_t enable)
+{
+    shm_client_set_motion(enable);
+}
+
+/* 屏幕上的位置滑条 -> core0 的位置目标。
+ * 【为什么这里只发一个整数】显示核不能直接改位置环状态(那是控制任务的数据),
+ * 只能把目标值经共享内存发过去, 由 core0 在 core1_sync() 里按序号锁存
+ * (见 src/dualcore/core1_boot.c 对 cmd_pos_seq 的处理)。 */
+void app_motion_set_target_rad(float pos_rad)
+{
+    shm_client_set_pos_mrad((int32_t)(pos_rad * 1000.0f));
+}
+
+uint8_t app_motion_is_enabled(void)
+{
+    return ((shm_client_telem()->status & SHM_STATUS_MOTION) != 0U) ? 1U : 0U;
+}

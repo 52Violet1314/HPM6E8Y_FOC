@@ -27,9 +27,11 @@
 #include "app_diag.h"
 #include "app_log.h"
 #include "app_encoder.h"
+#include "app_scope.h"      /* 电流环录波: ISR 里采样, 触发后转储成 CSV */
 #include "app_enc_lut.h"    /* 离线标定的 3200 组 raw -> 电角度表 */
 #include "app_motion.h"     /* 位置环 (外环, 输出速度给定) */
 #include "app_nv.h"
+#include "shm_core.h"       /* log_backend_shm: 反向日志环(core0 -> core1 的 UART14) */
 
 #include "bsp_pwm.h"
 #include "bsp_adc.h"
@@ -88,11 +90,15 @@ static volatile uint8_t s_motion_takeover;   /* 1 = 这一拍位置环改写了�
 static volatile uint8_t s_speed_ui_running;      /* 1 = 电机受控运行中 */
 static volatile uint8_t s_speed_ui_pending;      /* 1 = 目标值刚被改过 (读走即清) */
 static float            s_speed_ui_target_eff;   /* 实际下发值 (经斜坡), 便于界面显示 */
+
+/* ---- 延迟格式化日志的格式化回调 (定义在 app_run 之前, 但 app_init 里就要注册) ---- */
+static void app_log_format_rec(const app_log_rec_t *rec, char *out, uint32_t out_sz);
 static float            s_speed_ui_last_seen;    /* 上一拍看到的目标值, 用来判"变了" */
 
 #if APP_FOC_SPEED_LOOP_ENABLE
-/* 速度环 PI 积分项 (单位 A) 与上一次的 iq 给定 */
-static float s_spd_integ;
+/* 速度环: 通用 PID (pid.c)。增益/限幅在 app_init 里用下面这组宏初始化一次,
+ * 之后每拍只调 PID_Step(); 需要在线改参就 PID_SetGains()。 */
+static PID_Controller_t s_pid_spd;
 #endif
 
 /* 校准映射表转储节拍: 每 APP_CAL_MAP_DUMP_TICKS 次上报打印一次整张表。
@@ -205,6 +211,12 @@ static volatile uint8_t s_isr_closed_loop;
 static volatile uint32_t s_isr_cnt;      /* ADC 中断次数: 用来核对是不是 20kHz */
 static volatile uint32_t s_isr_dt_max;   /* 本窗口内两次中断的最大间隔(mcycle) */
 static volatile uint64_t s_isr_last_mcycle;
+/* 【电流环抖动量化】20kHz 域统计 id/iq 峰峰值。
+ * 为什么需要: 100Hz 的遥测采样对 kHz 级振荡只能看到混叠(前面好几轮都被它骗了,
+ * 明明在振却看不出幅度)。这里在中断里记 min/max, 任务侧每秒读一次再清零 ->
+ * 得到的是"真实摆幅", 直接对应啸叫强度。 */
+static volatile float s_isr_id_min = 1e9f, s_isr_id_max = -1e9f;
+static volatile float s_isr_iq_min = 1e9f, s_isr_iq_max = -1e9f;
 /* 【定位"谁堵了中断"】中断被拖长时, 记下当时主循环处于哪个阶段(见 app_diag.h 的
  * APP_STAGE_LOOP_*): 11=VBUS 12=电流 15=编码器 16=LCD 17=日志 18=USB。
  * 用途: 15ms 级的中断停摆会让高速下的电机顿挫, 但光看现象猜不出是谁;
@@ -475,7 +487,8 @@ static void app_console_init(void)
     intc_m_enable_irq_with_priority(BOARD_CONSOLE_UART_IRQ, APP_CON_UART_IRQ_PRIO);
 }
 
-/* USB 虚拟串口后端 (仅主机已连接时输出) */
+/* USB 虚拟串口后端 (仅主机已连接时输出; APP_LOG_USB_ENABLE=0 时整段不编译) */
+#if APP_LOG_USB_ENABLE
 static void log_backend_usb(const char *line)
 {
     if (bsp_usb_connected()) {
@@ -483,6 +496,25 @@ static void log_backend_usb(const char *line)
         (void)bsp_usb_write((const uint8_t *)line, (uint32_t)strlen(line));
         (void)bsp_usb_write((const uint8_t *)"\r\n", 2);
     }
+}
+#else
+static void log_backend_usb(const char *line)
+{
+    (void)line;     /* 见 app.h 的 APP_LOG_USB_ENABLE: 调电流环时关掉,
+                     * 免得 USB 提交把 ADC 中断推迟 250us */
+}
+#endif
+
+/* ---- 反向日志环后端: core0 的日志交给 core1 从 UART14 输出 ----
+ * 【为什么需要】core0 自己的两个口都指望不上: USB CDC 掉线就没了, UART0 是板上
+ * 调试口(不一定接出来)。而 core1 有一条独立的 UART14 —— 于是把日志推进共享内存的
+ * 反向环(log0), 由 core1 的显示任务取走直接写到那根线上。两个核的日志最终出现在
+ * 同一个串口, core0 这边一根线都不用接。
+ * 【开销】一次 strlen + memcpy 到 non-cacheable 共享区(约 200 字节), 在日志任务里跑。
+ * 环满直接丢并计数(shm->log0_dropped), 绝不等待。 */
+static void log_backend_shm(const char *line)
+{
+    (void)shm_log0_push(shm_get(), line);
 }
 
 /* ================= 中断回调 (由 BSP 在中断上下文调用) ================= */
@@ -580,8 +612,29 @@ static void app_on_adc_conv(void)
         foc_controller_run(&s_ctrl, ia, ib, ic, ang, s_isr_vbus);
         foc_controller_get_duty(&s_ctrl, &du, &dv, &dw);
         bsp_pwm_set_duty_uvw(du, dv, dw);
+
+        /* 20kHz 域记录 id/iq 的极值(见 s_isr_id_min 处的说明) */
+        {
+            float idv = s_ctrl.foc.id;
+            float iqv = s_ctrl.foc.iq;
+
+            if (idv < s_isr_id_min) { s_isr_id_min = idv; }
+            if (idv > s_isr_id_max) { s_isr_id_max = idv; }
+            if (iqv < s_isr_iq_min) { s_isr_iq_min = iqv; }
+            if (iqv > s_isr_iq_max) { s_isr_iq_max = iqv; }
+        }
     }
 #endif
+
+    /* 【电流环录波: 每拍记一组】放在闭环分支【外面】, 这样开环/调试模式下也能录。
+     * 只做 6 个 int16 写入 + 一次指针自增(几十个周期), 对 20kHz 没有影响;
+     * 转储由 app_scope_poll() 在控制任务里节流慢慢打(见 app_scope.h)。 */
+    app_scope_sample((int32_t)(s_ctrl.foc.id_ref * 1000.0f),
+                     (int32_t)(s_ctrl.foc.iq_ref * 1000.0f),
+                     (int32_t)(s_ctrl.foc.id * 1000.0f),
+                     (int32_t)(s_ctrl.foc.iq * 1000.0f),
+                     (int32_t)(s_ctrl.foc.ud * 1000.0f),
+                     (int32_t)(s_ctrl.foc.uq * 1000.0f));
 }
 
 /* MT6701 新帧到达 (SPI 后端在主循环里 poll, 属线程上下文, 不是中断) */
@@ -601,6 +654,119 @@ static void app_on_usb_rx(const uint8_t *data, uint32_t len)
     /* 预留: 可在此解析主机命令 (启停/调速等) */
 }
 
+/* ================= 方向标定 (物理量判据) =================
+ *
+ * 【判据】把速度环【整个旁路】, 直接给一个固定 iq, 看编码器【原始角】往哪边走:
+ *     正 iq 让 raw 增大 -> 编码器正方向与 iq 正方向一致 -> s_speed_dir = +1
+ *     正 iq 让 raw 减小 -> 反向                          -> s_speed_dir = -1
+ * 这个判据里没有任何反馈环, 符号不会被绕回去; 位置环此时还没使能, 也不会把电机
+ * 按住导致"测不出来"。这里是唯一能把"编码器计数方向 × 相电流极性 × 换向角约定"
+ * 三者合成符号【实测】出来的地方 —— 速度环和位置环必须与它同号, 否则就是正反馈。
+ *
+ * 【为什么抽成函数】原来这段只写在 app_init 的"第四步"里, 而这块板子上电时
+ * ADC 还没活(frames=0), app_init 在第二步就跑 return 了 —— 于是方向标定
+ * 【从来没执行过】, s_speed_dir 一直是静态默认值 +1。实测后果: 速度环/位置环
+ * 符号未验证, 一使能就是正反馈(电机原地 ±1500mA、±145RPM 剧烈震荡)。
+ * 现在延迟自检路径也会调用它(app_run 里, 在使能位置环之前)。
+ *
+ * 【前提】电机必须【空载】—— 带载时转子被负载拖住, 判据不可信。 */
+#if APP_FOC_CLOSED_LOOP_ENABLE && APP_FOC_SPEED_LOOP_ENABLE && APP_SPEED_DIR_AUTOTEST
+static void app_calib_speed_dir(float vbus_f)
+{
+    uint16_t raw_before;
+    int32_t  raw_delta;
+    uint32_t i;
+
+    s_speed_dir = APP_SPEED_DIR_SIGN;
+
+    /* 判据用"原始编码器角"而不是滤波后的 rpm: 后者是 alpha=0.1 的低通,
+     * 短窗口里远没跟上真实速度, 取符号等于在噪声里猜。 */
+    raw_before = bsp_mt6701_get_raw_angle();
+
+    /* 旁路速度环: 直接给固定 iq (d 轴 0) */
+    foc_controller_set_current_ref(&s_ctrl, 0.0f, APP_SPEED_DIR_TEST_IQ_A);
+
+    for (i = 0U; i < (APP_SPEED_DIR_TEST_MS / APP_MAIN_LOOP_MS); i++) {
+        app_init_run_cycles(1U, vbus_f);
+    }
+
+    raw_delta = (int32_t)bsp_mt6701_get_raw_angle() - (int32_t)raw_before;
+    /* 14bit 编码器, 按最短路径解卷绕(窗口内转角远小于半圈) */
+    if (raw_delta > 8192) {
+        raw_delta -= 16384;
+    } else if (raw_delta < -8192) {
+        raw_delta += 16384;
+    }
+
+    /* 收尾: 电流归零, 交回外环。积分必须清 —— 测试期间转子会转到几十 RPM,
+     * 速度环的积分会攒下饱和值。 */
+    foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, 0.0f);
+    s_speed_target_rpm = 0.0f;
+    PID_Reset(&s_pid_spd);
+
+    /* 幅值门限 200 counts ≈ 4.4°: 远大于编码器噪声, 又远小于本窗口的正常转角。
+     * 动得太少(被齿槽/静摩擦顶住)时不要随手判方向, 保留静态值并告警。 */
+    if ((raw_delta > 200) || (raw_delta < -200)) {
+        s_speed_dir = (raw_delta < 0) ? -APP_SPEED_DIR_SIGN : APP_SPEED_DIR_SIGN;
+        LOG_I("FOC", "方向标定: iq=+%d mA x %dms -> raw %u -> %u (d=%ld), s_speed_dir=%d",
+              (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
+              (unsigned)raw_before, (unsigned)bsp_mt6701_get_raw_angle(),
+              (long)raw_delta, (int)s_speed_dir);
+    } else {
+        s_speed_dir = APP_SPEED_DIR_SIGN;
+        LOG_I("FOC", "!! 方向标定失败: iq=+%d mA x %dms 只让 raw 动了 %ld counts "
+                     "(需要 >200) -> 转子可能被顶住/带载。保留静态 dir=%d, "
+                     "请空载重试或加大 APP_SPEED_DIR_TEST_IQ_A",
+              (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
+              (long)raw_delta, (int)s_speed_dir);
+    }
+}
+#else
+static void app_calib_speed_dir(float vbus_f)
+{
+    (void)vbus_f;      /* 未启用方向自检: 保持 APP_SPEED_DIR_SIGN 静态值 */
+}
+#endif
+
+/* ================= 电流环"交棒"给 20kHz 中断 =================
+ *
+ * 【为什么必须收成一个函数】
+ *   电流环的积分步长 (foc->ts) 必须等于它【实际被调用的周期】:
+ *       主循环驱动 -> 1ms (foc_controller_init 给的 dt)
+ *       中断驱动   -> 1/20000 = 50us
+ *   Ki 是乘 dt 用的, 两者差 20 倍, 用错就等于把 Ki 放大/缩小 20 倍 ——
+ *   这个环在 1kHz 上整定得很好, 换到 20kHz 上就是自激。
+ *
+ * 【实测事故 (2026-10-20, 就是本轮"还是啸叫"的根因)】
+ *   这块板子上电时 ADC 出帧比 app_init 晚(实测 app_init 里等 300ms 仍然 frames=0,
+ *   app_init 一返回就 19944 帧/秒), 于是 app_init 在"ADC 一帧都没采到"那一步
+ *   提前 return —— 而把 ts 改成 1/20000 的那行代码在它【后面】, 从来没执行过。
+ *   随后"延迟自检"路径补做了标定/极性/方向, 直接把 s_isr_closed_loop 置 1,
+ *   而 foc->ts 还停在 foc_controller_init() 给的 1ms。后果:
+ *       Ki_eff = 5844 × 20 = 116880  (等效把 300Hz 的环当 6kHz 调)
+ *       开环穿越频率从 300Hz 抬到约 1.5kHz, 相位裕度 -60° -> 自激
+ *   日志上的形状完全对得上: idpp≈1.5A / iqpp≈1.0A(给定只有 0.3A)、
+ *   ud/uq 满摆 ±4~5V(=在限幅圆上打转)、电机啸叫、转速恒 0、
+ *   而位置环/速度环接在这样一个内环后面, 无论怎么调都不可能跟踪。
+ *
+ *   现在"改 ts"和"置 s_isr_closed_loop"被绑在一起, 只有这一个入口,
+ *   两条使能路径(正常 app_init / 延迟自检)都必须从这里过, 不可能再漏一个。 */
+static void app_current_loop_handover_to_isr(void)
+{
+#if APP_CURRENT_LOOP_IN_ISR
+    foc_controller_set_dt(&s_ctrl, 1.0f / (float)APP_ADC_ISR_FREQ_HZ);
+    s_isr_closed_loop = 1U;
+    LOG_I("FOC", "current loop -> ADC ISR @%u Hz (ts=%u us), ADC trig cmp=%u/%u",
+          (unsigned)APP_ADC_ISR_FREQ_HZ, (unsigned)(1000000U / APP_ADC_ISR_FREQ_HZ),
+          (unsigned)bsp_pwm_get_adc_trig_count(), (unsigned)bsp_pwm_get_reload());
+#else
+    /* 电流环留在主循环里: ts 就是 app_init 一开始给的那个 dt, 不要动 */
+    foc_controller_set_dt(&s_ctrl, (float)APP_MAIN_LOOP_MS * 0.001f);
+    LOG_I("FOC", "current loop runs in main loop @%u Hz (ts=%u us)",
+          (unsigned)(1000U / APP_MAIN_LOOP_MS), (unsigned)(APP_MAIN_LOOP_MS * 1000U));
+#endif
+}
+
 /* ================= 初始化 ================= */
 void app_init(void)
 {
@@ -615,6 +781,12 @@ void app_init(void)
     app_console_init();
     app_log_add_backend(log_backend_console);
     app_log_add_backend(log_backend_usb);
+    /* 再挂一个"共享内存反向环"后端: core0 的日志由 core1 从 UART14 转发出去。
+     * 这样即使 USB CDC 掉线、UART0 没接, core0 的日志依然看得到。 */
+    app_log_add_backend(log_backend_shm);
+    /* 注册"延迟格式化"的格式化回调: 热路径日志(app_log_post)只传整数,
+     * 拼字符串由日志任务做 —— 见 app_log_format_rec。 */
+    app_log_set_formatter(app_log_format_rec);
 
     LOG_I("APP", "YeeZi HPM6EMotor open-loop demo");
 
@@ -705,6 +877,18 @@ void app_init(void)
     foc_controller_init(&s_ctrl, dt);
     foc_controller_set_voltage(&s_ctrl, APP_OPENLOOP_VOLTAGE_V);
     foc_controller_set_current_limit(&s_ctrl, APP_OPENLOOP_CURRENT_LIMIT);
+
+#if APP_FOC_SPEED_LOOP_ENABLE
+    /* 速度环 PID: 参数全部来自 app.h, 和电流环用同一个 PID_Step()。
+     *   - 输出限幅 = 积分限幅 = ±APP_FOC_SPEED_IQ_LIMIT_A (积分项就是稳态 iq);
+     *   - dt = 控制周期 APP_MAIN_LOOP_MS (速度环在 1kHz 主循环里跑);
+     *   - ki 单位 A/(RPM·s), 内部乘 dt。
+     * 【注意】这个 init 必须在 app_init 的早期(ADC 自检之前)完成: 那条 degraded
+     * 路径会提前 return, 但速度环在 app_run 里照样每拍被调用。 */
+    PID_InitSym(&s_pid_spd, APP_FOC_SPEED_KP, APP_FOC_SPEED_KI,
+                 (float)APP_MAIN_LOOP_MS * 0.001f,
+                 APP_FOC_SPEED_IQ_LIMIT_A, APP_FOC_SPEED_IQ_LIMIT_A);
+#endif
 
     /* 转速给定复位。
      * 【注意】这里不能调 app_speed_target_set(): 它会顺手把开环频率给定也改掉,
@@ -1236,12 +1420,10 @@ void app_init(void)
 #endif
 #if APP_CURRENT_LOOP_IN_ISR
     /* 把控制权交给 20kHz 中断: 积分步长固定成 1/20000, 然后打开中断里的闭环。
-     * (自检阶段 s_isr_closed_loop=0, 那时由主循环直接驱动控制器) */
-    foc_controller_set_dt(&s_ctrl, 1.0f / (float)APP_ADC_ISR_FREQ_HZ);
-    s_isr_closed_loop = 1U;
-    LOG_I("FOC", "current loop -> ADC ISR @%u Hz (ts=%u us), ADC trig cmp=%u/%u",
-          (unsigned)APP_ADC_ISR_FREQ_HZ, (unsigned)(1000000U / APP_ADC_ISR_FREQ_HZ),
-          (unsigned)bsp_pwm_get_adc_trig_count(), (unsigned)bsp_pwm_get_reload());
+     * (自检阶段 s_isr_closed_loop=0, 那时由主循环直接驱动控制器)
+     * 【两件事必须在同一个函数里做】见 app_current_loop_handover_to_isr 的说明:
+     * 只置标志不改 ts, 就是 20 倍积分增益的自激。 */
+    app_current_loop_handover_to_isr();
 #endif
 #if APP_MOTION_ENABLE
     /* 位置环: 只做初始化, 【先不要使能】。
@@ -1280,68 +1462,8 @@ void app_init(void)
      * "编码器计数方向 × 相电流极性 × FOC 角度约定"三者合成符号实测出来的地方。
      *
      * 【前提】电机必须【空载】—— 带载时转子被负载拖住/反转, 判据不可信。 */
-#if APP_FOC_CLOSED_LOOP_ENABLE && APP_FOC_SPEED_LOOP_ENABLE && APP_SPEED_DIR_AUTOTEST
-    {
-        uint16_t raw_before;
-        int32_t  raw_delta;
-        float    vbus_f = (float)bsp_adc_get_vbus_mv() * 0.001f;
-        uint32_t i;
-
-        s_speed_dir = APP_SPEED_DIR_SIGN;
-
-        /* 【判据用"原始编码器角"而不是滤波后的 rpm】
-         * 之前用 app_encoder_get_mech_rpm() 判方向, 而它是 foc_speed_est_update()
-         * 的低通输出(alpha=0.1): 8ms 只有 8 个样本, 滤波值远没跟上真实速度,
-         * 判据等于在噪声里取符号 —— 实测两次都判错。
-         * 原始角是"直接读数", 没有任何滤波/环路参与, 只要窗口够长、
-         * 电流够大让转子真的转起来, 符号就是确定的。 */
-        raw_before = bsp_mt6701_get_raw_angle();
-
-        /* 旁路速度环: 直接给固定 iq (d 轴 0)。iq>0 等价于"命令电机往 iq
-         * 正方向出力", 与 s_speed_dir 无关 —— 这正是判据干净的原因。 */
-        foc_controller_set_current_ref(&s_ctrl, 0.0f, APP_SPEED_DIR_TEST_IQ_A);
-
-        for (i = 0U; i < (APP_SPEED_DIR_TEST_MS / APP_MAIN_LOOP_MS); i++) {
-            app_init_run_cycles(1U, vbus_f);
-        }
-
-        raw_delta = (int32_t)bsp_mt6701_get_raw_angle() - (int32_t)raw_before;
-        /* 14bit 编码器, 按最短路径解卷绕(窗口内转角远小于半圈) */
-        if (raw_delta >  8192) {
-            raw_delta -= 16384;
-        } else if (raw_delta < -8192) {
-            raw_delta += 16384;
-        }
-
-        /* 收尾: 电流归零, 交回速度环/位置环。积分必须清 —— 测试期间如果
-         * 转子转到 ±几十 RPM, 速度环的积分会攒下饱和值。 */
-        foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, 0.0f);
-        s_speed_target_rpm = 0.0f;
-        s_spd_integ        = 0.0f;
-
-        /* 判据: 正 iq 让原始角增大 -> 编码器正方向和 iq 正方向一致(+1);
-         *       原始角减小 -> 反向(-1)。
-         *
-         * 【幅值门限】如果转子被齿槽/静摩擦顶住几乎没动(或窗口太短),
-         * 符号就是噪声 —— 这时【不要】随手判一个方向, 而是保留静态默认值并
-         * 明确告警, 让人上板处理(加电流/空载)。200 counts 对应机械角
-         * 200/16384*360 ≈ 4.4°, 远大于编码器噪声, 又远小于本窗口的正常转角。 */
-        if ((raw_delta > 200) || (raw_delta < -200)) {
-            s_speed_dir = (raw_delta < 0) ? -APP_SPEED_DIR_SIGN : APP_SPEED_DIR_SIGN;
-            LOG_I("FOC", "方向标定: iq=+%d mA x %dms -> raw %u -> %u (d=%ld), s_speed_dir=%d",
-                  (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
-                  (unsigned)raw_before, (unsigned)bsp_mt6701_get_raw_angle(),
-                  (long)raw_delta, (int)s_speed_dir);
-        } else {
-            s_speed_dir = APP_SPEED_DIR_SIGN;
-            LOG_I("FOC", "!! 方向标定失败: iq=+%d mA x %dms 只让 raw 动了 %ld counts "
-                         "(需要 >200) -> 转子可能被顶住/带载。保留静态 dir=%d, "
-                         "请空载重试或加大 APP_SPEED_DIR_TEST_IQ_A",
-                  (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
-                  (long)raw_delta, (int)s_speed_dir);
-        }
-    }
-#endif
+    /* 方向标定: 抽成函数, 延迟自检路径也会调用(见 app_calib_speed_dir) */
+    app_calib_speed_dir((float)bsp_adc_get_vbus_mv() * 0.001f);
 #if APP_MOTION_ENABLE
     LOG_I("FOC", "speed loop: dir=%d, target=%d RPM (位置环每拍会重写它)",
           (int)s_speed_dir, (int)s_speed_target_rpm);
@@ -1638,11 +1760,135 @@ void app_motion_set_target_rad(float pos_rad)
 #endif
 }
 
+/* ================= 延迟格式化 + 错峰投递 =================
+ *
+ * 【为什么】每秒一拍的结算窗口里有 4 条长日志(ctrl period / ADC ISR / 电流环峰
+ * 峰值 / FOC 状态行), 合计约 500 字符、25 个转换。原来它们在同一拍里【连续
+ * vsnprintf】—— 这一拍控制任务多花 100~200us(占 1ms 周期的 10~20%), 外环晚一拍,
+ * 现象就是"打印一下电机顿一下"。
+ *
+ * 现在做两件事:
+ *   1) 延迟格式化: 控制任务只把【已经算好的整数】塞进 app_log_rec_t 入队(约 0.3us),
+ *      snprintf 交给日志任务(见 app_log.c 的 app_log_task_body);
+ *   2) 错峰: 窗口结算时先把几条记录【快照】下来, 之后每拍只投递一条 ——
+ *      4 条摊到 4ms, 不再挤在同一拍, 串口那边也不会一次涌出 500 字符。
+ *
+ * 判读提示: "ctrl period: max=" 那一行如果原来明显大于 avg, 改完应该基本贴住 avg。
+ */
+enum {
+    APP_LR_CTRL_PERIOD = 1,     /* a0..a6: avg整,avg小, max整,max小, warn_ms, bad, cnt */
+    APP_LR_ADC_ISR,             /* a0..a2: rate, expect, dtmax_us */
+    APP_LR_IQ_PP,               /* a0..a1: idpp_mA, iqpp_mA */
+    APP_LR_FOC_LINE,            /* a0..a13: id,iq,idref,iqref,ud,uq,vbus,rpm,dir,pos,ref,err,spdref,raw */
+    APP_LR_ENC_HEALTH           /* a0..a13: reader(0=spi2,1=bitbang),bb,miso,fr,er,tfail,raw,last,step,steps,odo,stall,lutfull,lutreject */
+};
+
+/* 格式化回调: 【跑在日志任务里】, 不在控制任务里 —— 这就是"延迟格式化"的全部意义 */
+static void app_log_format_rec(const app_log_rec_t *r, char *out, uint32_t out_sz)
+{
+    switch (r->id) {
+#if APP_LOG_CTRL_PERIOD
+    case APP_LR_CTRL_PERIOD:
+        (void)snprintf(out, out_sz,
+                       "[INFO] [APP] ctrl period: avg=%d.%02d ms max=%d.%02d ms bad(>%dms)=%d/%d",
+                       (int)r->a[0], (int)r->a[1], (int)r->a[2], (int)r->a[3],
+                       (int)r->a[4], (int)r->a[5], (int)r->a[6]);
+        break;
+#endif
+
+#if APP_LOG_ISR_STAT
+    case APP_LR_ADC_ISR:
+        (void)snprintf(out, out_sz, "[INFO] [FOC] ADC ISR: 实测 %d 次 / 期望 %d 次, 最大间隔 %d us",
+                       (int)r->a[0], (int)r->a[1], (int)r->a[2]);
+        break;
+#endif
+
+#if APP_LOG_IQ_RIPPLE
+    case APP_LR_IQ_PP:
+        (void)snprintf(out, out_sz,
+                       "[INFO] [FOC] 电流环 1s 峰峰值: idpp=%d mA iqpp=%d mA "
+                       "(20kHz 域采样; 几十 mA 属正常开关纹波, 几百 mA 以上=自激)",
+                       (int)r->a[0], (int)r->a[1]);
+        break;
+#endif
+
+#if APP_LOG_FOC_LINE
+    case APP_LR_FOC_LINE:
+        (void)snprintf(out, out_sz,
+                       "[INFO] [FOC] id=%d iq=%d mA (ref %d/%d) ud=%d uq=%d mV vbus=%d mV "
+                       "rpm=%d dir=%d | pos=%d ref=%d err=%d mrad spdref=%d rpm raw=%d",
+                       (int)r->a[0], (int)r->a[1], (int)r->a[2], (int)r->a[3],
+                       (int)r->a[4], (int)r->a[5], (int)r->a[6], (int)r->a[7],
+                       (int)r->a[8], (int)r->a[9], (int)r->a[10], (int)r->a[11],
+                       (int)r->a[12], (int)r->a[13]);
+        break;
+#endif
+
+#if APP_LOG_ENC_HEALTH
+    case APP_LR_ENC_HEALTH:
+        /* 全场最长的一行(约 185 字符 / 14 个参数), 每 APP_ENC_HEALTH_MS(5s) 一次。
+         * 它是"控制任务里最贵的一次 vsnprintf", 所以同样延迟到日志任务里做。
+         * 【注意】这里只覆盖非 SEI 的分支(本板走 bitbang); SEI 分支仍是内联 LOG_I。 */
+        (void)snprintf(out, out_sz,
+                       "[INFO] [ENC] health: reader=%s bb=%d miso=%d frames=%d errs=%d tfail=%d "
+                       "raw=%d last=%06x sweep=%d/%d odo=%d stall=%d lut=%d/%d",
+                       (r->a[0] != 0) ? "bitbang" : "spi2",
+                       (int)r->a[1], (int)r->a[2], (int)r->a[3], (int)r->a[4],
+                       (int)r->a[5], (int)r->a[6], (unsigned)r->a[7],
+                       (int)r->a[8], (int)r->a[9], (int)r->a[10],
+                       (int)r->a[11], (int)r->a[12], (int)r->a[13]);
+        break;
+#endif
+
+    default:
+        (void)snprintf(out, out_sz, "[WARN] [APP] 未知延迟日志 id=%u", (unsigned)r->id);
+        break;
+    }
+}
+
+#define APP_DEFER_MAX  (6U)    /* 1 秒窗口里有 4 条; 每 5 秒会和 ENC health 撞在一起 -> 5 条, 留 1 条余量 */
+static app_log_rec_t s_defer[APP_DEFER_MAX];
+static uint8_t       s_defer_cnt;
+static uint8_t       s_defer_pos;
+
+/* 快照一条待发记录(在 1 秒结算点调用, 此时把要打印的数值定下来) */
+static void app_defer_push(uint16_t id, const int32_t *a, uint8_t n)
+{
+    app_log_rec_t *r;
+
+    if ((s_defer_cnt >= (uint8_t)APP_DEFER_MAX) || (n > APP_LOG_REC_MAX_ARGS)) {
+        return;
+    }
+    r = &s_defer[s_defer_cnt++];
+    r->id = id;
+    r->n = n;
+    for (uint8_t i = 0U; i < n; i++) {
+        r->a[i] = a[i];
+    }
+}
+
+/* 每拍最多投递一条 —— 放在 app_run() 的最前面, 任何 return 路径都不会漏掉它 */
+static void app_defer_drain(void)
+{
+    if (s_defer_pos < s_defer_cnt) {
+        (void)app_log_post(&s_defer[s_defer_pos]);
+        s_defer_pos++;
+        if (s_defer_pos >= s_defer_cnt) {
+            s_defer_pos = 0U;
+            s_defer_cnt = 0U;
+        }
+    }
+}
+
 /* ================= 主循环 ================= */
 void app_run(void)
 {
     static uint32_t tick = 0;
     int32_t iu_ma = 0, iv_ma = 0, iw_ma = 0;
+
+    /* 【必须放在最前面】错峰投递那些"延迟格式化"的日志: 每拍只发一条。
+     * 放在这里而不是结算点, 是为了不让 4 条挤在同一拍。 */
+    app_defer_drain();
     float ia, ib, ic, vbus;
     float du, dv, dw;
 
@@ -1733,19 +1979,119 @@ void app_run(void)
                 }
 
                 s_cur_sign = ((pr & 0x02U) != 0U) ? -1.0f : 1.0f;
+                /* 【强制覆盖: 两套判据会打架】
+                 * 延迟路径用的是这里的两点判据(0°/90° 各钉一次, 只看 va[0] 的符号),
+                 * 而 app_init 用的是四角度投影打分(0/90/180/270°, 6 种相序 x 2 种
+                 * 极性里挑投影最大的)。两者对同一台电机可以给出【相反】的结论 ——
+                 * 实测: 两点判据报 sign=-1 之后, 电流环 ud/uq 双双顶到母线限幅、
+                 * id 冲到 2.1A, 而 iq 给定 +1500mA 实测 -498mA, 这正是"反馈反号
+                 * -> 正反馈"的形状; 一旦正反馈, 外面套的速度环/位置环无论怎么调
+                 * 都不可能守住(位置环那次 spdref 恒为 0, 根本没参与)。
+                 *
+                 * 判据谁对, 只能由"电流环跟不跟得上给定"来裁决:
+                 *   - 强制 APP_CURRENT_SIGN=+1 后若 id≈0 且 iq 跟随给定 -> 两点判据的
+                 *     符号反了(应改 app.c 里 `if (va[0] < 0.0f) res |= 0x02U;`);
+                 *   - 若反而是 -1 才跟随 -> 两点判据正确, 去查角度/换向约定。
+                 * 确认之后把这里改回 0(自动), 并把结论写进 app.h。 */
+                if (APP_CURRENT_SIGN != 0.0f) {
+                    if (s_cur_sign != APP_CURRENT_SIGN) {
+                        LOG_I("ADC", "极性: 两点判据给出 %d, 被 APP_CURRENT_SIGN 覆盖为 %d",
+                              (int)s_cur_sign, (int)APP_CURRENT_SIGN);
+                    }
+                    s_cur_sign = APP_CURRENT_SIGN;
+                }
                 LOG_I("ADC", "极性自检结果: sign=%d", (int)s_cur_sign);
+
+                /* ---- 【采样时刻自检】把"ADC 触发点 vs 开关沿"的距离打出来 ----
+                 * 三下桥全通(能采低边电流)的窗口以计数器回绕点为中心, 半宽:
+                 *     reload/2 - duty_max×0.98×reload/2
+                 * (0.98 见 bsp_pwm.c 的 s_duty_max; 闭环里 duty 被
+                 *  vmax=vdc/√3×0.85 的矢量限幅压住, 最坏 0.925)
+                 * 默认触发点 cmp=1 就落在窗口中心, 所以余量 = 上式。
+                 * 【余量太小会怎样】实测到过 10A 的假值: 采样窗压到开关沿上,
+                 * 运放被 12V 的 dv/dt 打飞。余量 < ~1us 就要怀疑读数了。 */
+                {
+                    uint32_t reload = bsp_pwm_get_reload();
+                    uint32_t trig   = bsp_pwm_get_adc_trig_count();
+                    uint32_t half   = reload / 2U;
+                    uint32_t cmph   = (uint32_t)(0.925f * 0.98f * (float)reload) / 2U;
+                    uint32_t margin = (half > cmph) ? (half - cmph) : 0U;
+
+                    /* PWM 计数时钟: 20kHz × (reload+1) = 200MHz -> 1 count = 5ns */
+                    LOG_I("ADC", "采样点: trig_cmp=%u/%u (窗口中心), 余量=%u counts ≈ %u ns, 采保=20clk",
+                          (unsigned)trig, (unsigned)reload, (unsigned)margin,
+                          (unsigned)(margin * 5U));
+                }
+
+                /* ---- 方向标定 (必须在这里做, 不能只靠 app_init) ----
+                 * app_init 的"第四步: 方向标定"在这块板子上【从来不会执行】:
+                 * 上电时 ADC 还没活(frames=0), app_init 在第二步就 return 了。
+                 * 于是 s_speed_dir 一直停在静态默认值 +1, 速度环/位置环的符号
+                 * 从没被实测过 —— 一使能就是正反馈: 实测 iq 顶 ±1500mA、
+                 * 转速 ±145RPM 原地剧烈震荡, 位置环也守不住。
+                 * 这里在【使能位置环之前】补做, 顺序和 app_init 的注释一致:
+                 *     电流环 -> 方向自检 -> 位置环使能
+                 * 测试要驱动电流, 所以先使能控制器; 测试内部结束时会归零并
+                 * 清速度环积分。 */
+                foc_controller_enable(&s_ctrl, true);
+                app_calib_speed_dir((float)bsp_adc_get_vbus_mv() * 0.001f);
 
                 /* ---- 全部通过: 使能电流环, 位置环用当前角度原地保持 ---- */
                 s_adc_dead = 0U;
 
                 foc_controller_enable(&s_ctrl, true);
 #if APP_CURRENT_LOOP_IN_ISR
-                s_isr_closed_loop = 1U;
+                /* 【本轮啸叫的根因就在这一行原来只有 s_isr_closed_loop = 1U】
+                 * 延迟自检路径绕过了 app_init 里那次 set_dt(1/20000), 于是电流环
+                 * 带着 ts=1ms 跑到 20kHz 中断里 —— Ki 等效放大 20 倍, 电流环自激、
+                 * 满摆 ±5V、啸叫, 而外环(速度/位置)接在自激的内环后面永远跟不上。
+                 * 现在统一从 app_current_loop_handover_to_isr() 走, 它同时改 ts。 */
+                app_current_loop_handover_to_isr();
 #endif
 #if APP_MOTION_ENABLE
                 (void)bsp_mt6701_poll();
                 (void)app_encoder_update(&s_encoder);
+                /* ---- 【按键必须在这里补初始化: app_init 里那次永远执行不到】 ----
+                 * app_init 的 bsp_button_init() 在"ADC 一帧都没采到 -> degraded mode"
+                 * 那个 return 的【后面】, 而这块板子上 ADC 出帧永远晚于 app_init
+                 * (实测 app_init 等 300ms 仍 frames=0, 随后延迟自检里 frames=20521),
+                 * 所以那几个按键脚从来没被配置过: 没复用成 GPIO、没开内部上拉、
+                 * 方向也没设。浮空脚读出来是随机值 —— 轻则"按了没反应", 重则被当成
+                 * 一直按住 -> 触发 HOME -> 位置目标归零 -> 位置环满力去追
+                 * (bsp_button.c 的注释里记的就是这个事故)。
+                 * 这里补一次。bsp_button_init() 是幂等的, 重复调用无害。 */
+                {
+                    static uint8_t s_btn_brought_up;
+
+                    if (s_btn_brought_up == 0U) {
+                        s_btn_brought_up = 1U;
+                        bsp_button_init();
+                        LOG_I("BTN", "按键就绪(延迟路径): %s=位置+  %s=位置-  %s=回起点",
+                              bsp_button_name(BSP_BTN_UP),
+                              bsp_button_name(BSP_BTN_DOWN),
+                              bsp_button_name(BSP_BTN_HOME));
+                    }
+                }
+                /* 【必须先 init 再 enable —— 这就是位置环"守不住"的根因】
+                 * app_init() 在 ADC 没活过来时第 922 行就 return 了, 而
+                 * app_motion_init(&s_motion) 在它后面的第 1256 行 —— 于是延迟
+                 * 自检这条路【从来没有初始化过位置环】: pos_kp / speed_limit
+                 * 停在 .bss 的 0, P 律 clamp(kp*err, 0) 恒等于 0。
+                 * 现象就是日志里那几个数字: 位置环"已使能"、err 涨到 20~85 rad,
+                 * 而 spdref 恒为 0 —— 环在, 但永远不出力, 电机只剩速度环自己在
+                 * 守 0 转速, 一有扰动就漂走, 最后过流锁死。
+                 * 注意 app_motion_init() 会把 pos_ref/pos_fb 清零, 所以必须在
+                 * 下面的 app_motion_enable() 之前调用(enable 会用当前角度重新
+                 * 建立"原地保持"的基准)。 */
+                app_motion_init(&s_motion);
                 app_motion_enable(&s_motion, true, app_encoder_get_mech_rad(&s_encoder));
+                /* 【打结构体里的实际值, 不要打宏】
+                 * 上一版这里打的是 APP_MOTION_POS_KP / APP_MOTION_SPEED_LIMIT_RPM,
+                 * 结构体明明是 0 也照样显示 60 —— 正好把上面这个 bug 盖住了。 */
+                LOG_I("MOT", "position loop ON: pos0=%d mrad, kp=%d mRPM/rad, 速度限幅=%d RPM, dir=%d",
+                      (int)(s_motion.pos_fb * 1000.0f),
+                      (int)(s_motion.pos_kp * 1000.0f), (int)s_motion.speed_limit,
+                      (int)s_speed_dir);
 #endif
                 LOG_I("APP", "delayed bring-up done: 电机已使能(电流环闭环, sign=%d), 位置环原地保持",
                       (int)s_cur_sign);
@@ -1815,12 +2161,22 @@ void app_run(void)
 #endif
 
         /* 交给速度环 (内环)。速度环由 APP_FOC_SPEED_LOOP_ENABLE 打开 —— 
-         * 位置环必须靠它提供阻尼, 见 app.h 的说明。 */
-        app_speed_target_set(spd_ref);
+         * 位置环必须靠它提供阻尼, 见 app.h 的说明。
+         *
+         * 【只有位置环真的在跑才接管】app_motion_run() 在未使能时返回 0; 如果照旧
+         * 无条件 app_speed_target_set(spd_ref), 那就等于每拍把目标转速压成 0 ——
+         * 屏幕上把位置环关掉之后滑条就彻底没用了(电机只会停住), 这正是"速度环和
+         * 位置环打架"里最容易忽略的一半: 关掉位置环并不自动等于"回到速度模式",
+         * 还必须停止用位置环的输出覆盖速度给定。
+         * 切到速度模式时由界面重新下发一次滑条值(见 lcd_ui.c 的开关回调),
+         * 否则目标会停在位置环最后一次写下的 spdref 上。 */
+        if (s_motion.enable) {
+            app_speed_target_set(spd_ref);
 
-        /* 标记"本拍位置环接管了速度给定"。app_speed_apply() 会把状态拍成快照,
-         * 显示层据此显示位置环状态而不是把速度条的值当成用户设定。 */
-        s_motion_takeover = 1U;
+            /* 标记"本拍位置环接管了速度给定"。app_speed_apply() 会把状态拍成快照,
+             * 显示层据此显示位置环状态而不是把速度条的值当成用户设定。 */
+            s_motion_takeover = 1U;
+        }
     }
 
     /* ---- 按键位置点动 (板上 Key2/Key3 + J11 外接回起点键) ----
@@ -1898,7 +2254,7 @@ void app_run(void)
             static uint32_t btn_log_tick;
 
             btn_log_tick += APP_MAIN_LOOP_MS;
-            if (btn_log_tick >= 5000U) {
+            if (APP_LOG_BTN_LEVEL && (btn_log_tick >= 5000U)) {
                 btn_log_tick = 0U;
                 LOG_I("BTN", "按键电平: %s=%u %s=%u %s=%u (松开应全为 0, 按住该按键变 1)",
                       bsp_button_name(BSP_BTN_UP),
@@ -1955,17 +2311,32 @@ void app_run(void)
                       (unsigned)s_lut_full, (unsigned)s_lut_reject);
             }
 #else
-            LOG_I("ENC",
-                  "health: reader=%s bb=%d miso=%u frames=%u errs=%u tfail=%u raw=%u last=%06x "
-                  "sweep=%u/%u odo=%ld stall=%u lut=%u/%u",
-                  bsp_bb_is_active() ? "bitbang" : "spi2",
-                  (int)bsp_bb_best_index(), (unsigned)mi,
-                  (unsigned)fr, (unsigned)er, (unsigned)tf,
-                  (unsigned)bsp_mt6701_get_raw_angle(),
-                  (unsigned)bsp_mt6701_get_last_raw(),
-                  (unsigned)s_sweep_step, (unsigned)s_sweep_steps,
-                  (long)s_sweep_odo, (unsigned)s_sweep_stall,
-                  (unsigned)s_lut_full, (unsigned)s_lut_reject);
+#if APP_LOG_ENC_HEALTH
+            {
+                int32_t a[14];
+
+                /* 【延迟格式化】这条 185 字符 / 14 参数, 原来每 5 秒在控制任务里内联
+                 * vsnprintf 一次 —— 是"打印一下电机顿一下"里最贵的一条。 */
+                a[0]  = bsp_bb_is_active() ? 1 : 0;
+                a[1]  = (int32_t)bsp_bb_best_index();
+                a[2]  = (int32_t)mi;
+                a[3]  = (int32_t)fr;
+                a[4]  = (int32_t)er;
+                a[5]  = (int32_t)tf;
+                a[6]  = (int32_t)bsp_mt6701_get_raw_angle();
+                a[7]  = (int32_t)bsp_mt6701_get_last_raw();
+                a[8]  = (int32_t)s_sweep_step;
+                a[9]  = (int32_t)s_sweep_steps;
+                a[10] = (int32_t)(long)s_sweep_odo;
+                a[11] = (int32_t)s_sweep_stall;
+                a[12] = (int32_t)s_lut_full;
+                a[13] = (int32_t)s_lut_reject;
+                app_defer_push(APP_LR_ENC_HEALTH, a, 14U);
+            }
+#else
+            (void)er;       /* 关掉体检行时这两个量没人用 */
+            (void)tf;
+#endif  /* APP_LOG_ENC_HEALTH */
 #endif
 
             if (fr == 0U) {
@@ -2043,7 +2414,13 @@ void app_run(void)
                 foc_controller_set_dt(&s_ctrl, dt_meas);
 #else
                 /* 电流环跑在 20kHz 中断里, 它的积分步长固定是 1/20000 ——
-                 * 这里绝不能再按主循环周期改写, 否则积分增益差 20 倍。 */
+                 * 这里绝不能再按主循环周期改写, 否则积分增益差 20 倍。
+                 * 【但必须"盯着"它】只要中断闭环是开着的, 每拍就把 ts 强制回
+                 * 1/20000: 这样即使将来又多出某条使能路径忘了改 ts(2026-10-20
+                 * 那次事故就是延迟自检路径漏了), 也最多错一拍, 不会一路自激。 */
+                if (s_isr_closed_loop != 0U) {
+                    foc_controller_set_dt(&s_ctrl, 1.0f / (float)APP_ADC_ISR_FREQ_HZ);
+                }
 #endif
             }
         }
@@ -2076,12 +2453,19 @@ void app_run(void)
 
         if (period_cnt >= (1000U / APP_MAIN_LOOP_MS)) {
             uint32_t avg100 = period_sum100 / period_cnt;
+            int32_t  a[7];
 
-            LOG_I("APP", "ctrl period: avg=%u.%02u ms max=%u.%02u ms bad(>%ums)=%u/%u",
-                  (unsigned)(avg100 / 100U), (unsigned)(avg100 % 100U),
-                  (unsigned)(period_max100 / 100U), (unsigned)(period_max100 % 100U),
-                  (unsigned)APP_CTRL_PERIOD_WARN_MS,
-                  (unsigned)period_bad, (unsigned)period_cnt);
+            /* 【延迟格式化 + 错峰】见 app_log_format_rec 上面的说明:
+             * 这里只算数、快照, 不拼字符串。 */
+            a[0] = (int32_t)(avg100 / 100U);
+            a[1] = (int32_t)(avg100 % 100U);
+            a[2] = (int32_t)(period_max100 / 100U);
+            a[3] = (int32_t)(period_max100 % 100U);
+            a[4] = (int32_t)APP_CTRL_PERIOD_WARN_MS;
+            a[5] = (int32_t)period_bad;
+            a[6] = (int32_t)period_cnt;
+            app_defer_push(APP_LR_CTRL_PERIOD, a, 7U);
+
             period_cnt     = 0U;
             period_bad     = 0U;
             period_sum100  = 0U;
@@ -2375,19 +2759,30 @@ void app_run(void)
 #endif
                 foc_controller_enable(&s_ctrl, false);
                 bsp_pwm_enable_output(false);
+                /* 过流瞬间强制录一份: 录波是"环形一直采 + 触发后补一半"的,
+                 * 所以这里触发拿到的是【过流前 25.6ms + 之后 25.6ms】,
+                 * 正好覆盖失控的起点(转储在随后几秒里由 app_scope_poll 打出)。 */
+                app_scope_trigger();
                 /* 把三相电流和当时的 id/iq 全打出来: 判断是"真过流"还是"电流换算
-                 * (采样电阻/增益)偏大导致误触发"。注意这个保护是锁死的, 复位才恢复。 */
-                LOG_I("FOC", "OVERCURRENT %d mA x%u (ia=%d ib=%d ic=%d) id=%d iq=%d rpm=%d sign=%d -> output OFF (锁死, 需复位)",
+                 * (采样电阻/增益)偏大导致误触发"。注意这个保护是锁死的, 复位才恢复。
+                 * 【带上 duty】如果这次过流是"采样点踩到开关沿"造成的假值, duty 往往
+                 * 正在极端值(接近 0 或 0.98): 三个占空比一起看就能分辨 —— 真过流时
+                 * duty 通常还在中段, 假值时常常有一相已贴边。 */
+                LOG_I("FOC", "OVERCURRENT %d mA x%u (ia=%d ib=%d ic=%d) id=%d iq=%d rpm=%d sign=%d "
+                             "duty=%d/%d/%d permille -> output OFF (锁死, 需复位)",
                       (int)(imax * 1000.0f), (unsigned)s_oc_cnt,
                       (int)(ia * 1000.0f), (int)(ib * 1000.0f), (int)(ic * 1000.0f),
                       (int)(s_ctrl.foc.id * 1000.0f), (int)(s_ctrl.foc.iq * 1000.0f),
-                      (int)app_encoder_get_mech_rpm(&s_encoder), (int)s_cur_sign);
+                      (int)app_encoder_get_mech_rpm(&s_encoder), (int)s_cur_sign,
+                      (int)(s_ctrl.foc.duty_u * 1000.0f),
+                      (int)(s_ctrl.foc.duty_v * 1000.0f),
+                      (int)(s_ctrl.foc.duty_w * 1000.0f));
             }
 
             if (s_oc_tripped != 0U) {
                 /* 锁死后速度环积分必须清零: 否则复位重跑时它会带着旧积分冲出去 */
 #if APP_FOC_SPEED_LOOP_ENABLE
-                s_spd_integ = 0.0f;
+                PID_Reset(&s_pid_spd);
 #endif
                 iq = 0.0f;
             } else {
@@ -2408,22 +2803,15 @@ void app_run(void)
                 {
                     float target = s_speed_target_rpm * s_speed_dir;
                     float e      = target - rpm;
-                    float kp     = APP_FOC_SPEED_KP;
-                    float ki     = APP_FOC_SPEED_KI;
 
-                    s_spd_integ += (ki * e * ((float)APP_MAIN_LOOP_MS * 0.001f));
-                    if (s_spd_integ >  APP_FOC_SPEED_IQ_LIMIT_A) {
-                        s_spd_integ =  APP_FOC_SPEED_IQ_LIMIT_A;
-                    } else if (s_spd_integ < -APP_FOC_SPEED_IQ_LIMIT_A) {
-                        s_spd_integ = -APP_FOC_SPEED_IQ_LIMIT_A;
-                    }
-
-                    iq = (kp * e) + s_spd_integ;
-                    if (iq >  APP_FOC_SPEED_IQ_LIMIT_A) {
-                        iq =  APP_FOC_SPEED_IQ_LIMIT_A;
-                    } else if (iq < -APP_FOC_SPEED_IQ_LIMIT_A) {
-                        iq = -APP_FOC_SPEED_IQ_LIMIT_A;
-                    }
+                    /* 统一到 pid.c 的通用 PID —— 和电流环、位置环同一个实现
+                     * (语义同 F405_M3508_FOC 的 PID_Step):
+                     *   kp/ki/dt 来自 APP_FOC_SPEED_*, 输出限幅 ±IQ_LIMIT,
+                     *   积分限幅也 ±IQ_LIMIT(积分项本身就等于稳态所需 iq)。
+                     * 【和原来手写版的区别】原来是"先积分、再把输出限幅",
+                     * 饱和时积分照样涨(典型 windup); 现在是条件积分: 输出没饱和,
+                     * 或饱和了但误差在往回拉, 才积分。 */
+                    iq = PID_Step(&s_pid_spd, e);
                 }
 #else
                 /* ---- b) 软限速, 代替原来的开关式 ----
@@ -2477,6 +2865,30 @@ void app_run(void)
                 }
 #endif /* APP_FOC_SPEED_LOOP_ENABLE */
             }
+
+#if APP_IQ_STEP_TEST_ENABLE
+            /* 【电流环阶跃测试】完全旁路外环, 直接给 iq 方波 (见 app.h 的说明)。
+             * 每次跳变都会命中录波的 |Δiq_ref| 触发, 于是串口上自动得到一串
+             * "阶跃响应", 拿它调电流环 Kp/Ki。
+             * 【幅值必须小】1.5A 在 3.1Ω 上要 4.65V, 而电压天花板只有
+             * vdc/√3×0.85 ≈ 5.9V —— 大电流下环路一直贴限幅, 看到的不是增益
+             * 特性而是饱和。默认 0.3A(约 1V)才有干净的阶跃。 */
+            {
+                static uint32_t step_ms;
+                static uint8_t  step_hi;
+
+                step_ms += APP_MAIN_LOOP_MS;
+                if (step_ms >= APP_IQ_STEP_HALF_MS) {
+                    step_ms = 0U;
+                    step_hi = (uint8_t)(step_hi ^ 1U);
+                }
+                iq = (step_hi != 0U) ? APP_IQ_STEP_AMP_A : -APP_IQ_STEP_AMP_A;
+
+                /* 位置环/速度环此刻算出来的东西全部作废, 顺便把速度环的积分
+                 * 清掉 —— 否则测试完一切回闭环, 那个被憋住的积分会突然出力。 */
+                PID_Reset(&s_pid_spd);
+            }
+#endif
 
             foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, iq);
         }
@@ -2536,6 +2948,10 @@ void app_run(void)
     }
     diag_set_stage(APP_STAGE_LOOP_DONE);
 
+    /* 录波转储: 触发了就把缓冲区按 APP_SCOPE_DUMP_MS 节流打成 CSV
+     * (串口慢, 必须节流; 环形缓冲塞不下的行会被整行丢掉, 曲线就有洞) */
+    app_scope_poll();
+
     /* ---- 电流环体检: 每秒一行 id/iq/ud/uq ----
      * 做电流环没有这行等于闭着眼调: 看 iq 有没有跟到 iq_ref、
      * id 有没有被压住(应该 ~0)、ud/uq 有没有顶到限幅。
@@ -2545,6 +2961,27 @@ void app_run(void)
         static uint32_t cur_log_tick = 0U;
 #if APP_CURRENT_LOOP_IN_ISR
         static uint32_t isr_cnt_prev = 0U;
+        static uint8_t  isr_first    = 1U;
+        static float    win_time;           /* 本窗口(1s)累计的【真实】时长, 单位 s */
+#endif
+
+        /* 【每拍累加窗口时长, 不是"关闭窗口那一拍才加"】
+         * 原来 win_time += s_dt_main 写在下面那个 if (cur_log_tick >= 1000) 里面,
+         * 于是整个 1s 窗口只累加到【最后一拍】的 dt(约 1ms):
+         *     expect = 20000 × 0.001 = 20 次
+         * 日志里 "实测 20011 次 / 期望 27 次" 就是这么来的 —— 期望值本身是错的。
+         * 更要紧的是下面那条看门狗 (rate < expect/4 就封锁输出) 因此永远不成立
+         * (20000 < 5), 等于【没有任何保护】: 中断真停摆时占空比会冻结在最后一拍,
+         * 绕组可能一直通直流而没人管。现在按每拍累加, expect 才是真的 20kHz 期望。 */
+#if APP_CURRENT_LOOP_IN_ISR
+        if (isr_first != 0U) {
+            /* 第一窗口: 基准/时长都从现在开始记, 否则 rate 会是上电累计次数 */
+            isr_first    = 0U;
+            isr_cnt_prev = s_isr_cnt;
+            win_time     = 0.0f;
+        } else if ((s_dt_main > 0.0f) && (s_dt_main < 0.05f)) {
+            win_time += s_dt_main;
+        }
 #endif
 
         cur_log_tick += APP_MAIN_LOOP_MS;
@@ -2561,15 +2998,13 @@ void app_run(void)
                  * (实测主循环约 0.96~1.2ms 之间变), 写死一个数只会误导; 而"最大间隔"
                  * 只报不处理, 看着像故障却什么也不做。都不打了, 只在真出问题时报警。
                  *
-                 * 期望值这里改用【实测主循环周期累加】出来的本窗口真实时长来算,
-                 * 不再假设窗口就是 1 秒。 */
-                static float win_time;
-                uint32_t     now  = s_isr_cnt;
-                uint32_t     rate = now - isr_cnt_prev;
-                uint32_t     expect;
+                 * 期望值这里用【实测主循环周期累加】出来的本窗口真实时长来算,
+                 * 不再假设窗口就是 1 秒(那个累加现在在窗口外面, 见上)。 */
+                uint32_t now  = s_isr_cnt;
+                uint32_t rate = now - isr_cnt_prev;
+                uint32_t expect;
 
                 isr_cnt_prev = now;
-                win_time += s_dt_main;
                 expect = (uint32_t)((float)APP_ADC_ISR_FREQ_HZ * win_time);
 
 #if APP_LOG_ISR_STAT
@@ -2577,10 +3012,13 @@ void app_run(void)
                 {
                     uint32_t dtmax_us = (uint32_t)(((uint64_t)s_isr_dt_max * 1000000U)
                                                    / (uint64_t)hpm_core_clock);
+                    int32_t  a[3];
 
                     s_isr_dt_max = 0U;
-                    LOG_I("FOC", "ADC ISR: 实测 %u 次 / 期望 %u 次, 最大间隔 %u us",
-                          (unsigned)rate, (unsigned)expect, (unsigned)dtmax_us);
+                    a[0] = (int32_t)rate;
+                    a[1] = (int32_t)expect;
+                    a[2] = (int32_t)dtmax_us;
+                    app_defer_push(APP_LR_ADC_ISR, a, 3U);
                 }
 #endif
                 s_isr_dt_max = 0U;
@@ -2595,6 +3033,23 @@ void app_run(void)
                 }
                 win_time = 0.0f;
 
+                /* 【电流环峰峰值】取上个 1s 窗口在 20kHz 域记下的极值, 然后重新开始记。
+                 * 判读: idpp/iqpp 只有几十 mA = 只有开关纹波(正常);
+                 *       几百 mA~A 级  = 电流环在自激(这就是啸叫的来源)。 */
+                {
+#if APP_LOG_IQ_RIPPLE
+                    float   idpp = (s_isr_id_max - s_isr_id_min) * 1000.0f;
+                    float   iqpp = (s_isr_iq_max - s_isr_iq_min) * 1000.0f;
+                    int32_t a[2];
+
+                    a[0] = (int32_t)idpp;
+                    a[1] = (int32_t)iqpp;
+                    app_defer_push(APP_LR_IQ_PP, a, 2U);
+#endif
+                    s_isr_id_min = s_isr_id_max = s_ctrl.foc.id;
+                    s_isr_iq_min = s_isr_iq_max = s_ctrl.foc.iq;
+                }
+
                 if ((s_isr_closed_loop != 0U) && (rate < (expect / 4U))) {
                     s_isr_closed_loop = 0U;
                     foc_controller_enable(&s_ctrl, false);
@@ -2604,6 +3059,16 @@ void app_run(void)
                 }
             }
 #endif
+            /* 【打点节流】这条 132 字符 = 1.4ms 串口时间(921600 baud), 和同一次
+             * 突发里的 ctrl period / ADC ISR 加起来每秒 ~2.7ms。调电流环时把它
+             * 降到 1/5 或 1/10(见 app.h 的 APP_LOG_FOC_EVERY_N), 串口就不会把
+             * 后面的 100Hz CSV 挤掉, 日志任务对 ADC 中断的干扰也小得多。 */
+            {
+                static uint32_t foc_line_div;
+
+                if (APP_LOG_FOC_LINE &&
+                    (++foc_line_div >= (uint32_t)APP_LOG_FOC_EVERY_N)) {
+                    foc_line_div = 0U;
 #if APP_MOTION_ENABLE
             /* 带上位置环数据: 目标是 posref, 反馈是 pos, 两者之差 err 就是位置环的
              * 输入; spdref 是位置环给出的速度给定(交给速度环)。调位置环看这行:
@@ -2615,35 +3080,47 @@ void app_run(void)
              *   rpm    = 滤波后的机械转速, 它和 raw 的差分必须【同向】;
              *   spdref = 位置环给出的速度给定;
              *   iq     = 速度环 PI 的输出, 它和 (spdref - rpm) 必须【同向】。
-             * 任何一对不同向, 那一对之间的环节就是反的 —— 不用再猜。 */
-            LOG_I("FOC", "id=%d iq=%d mA (ref %d/%d) ud=%d uq=%d mV vbus=%d mV rpm=%d dir=%d | "
-                         "pos=%d ref=%d err=%d mrad spdref=%d rpm raw=%u",
-                  (int)(s_ctrl.foc.id * 1000.0f),
-                  (int)(s_ctrl.foc.iq * 1000.0f),
-                  (int)(s_ctrl.foc.id_ref * 1000.0f),
-                  (int)(s_ctrl.foc.iq_ref * 1000.0f),
-                  (int)(s_ctrl.foc.ud * 1000.0f),
-                  (int)(s_ctrl.foc.uq * 1000.0f),
-                  (int)bsp_adc_get_vbus_mv(),
-                  (int)app_encoder_get_mech_rpm(&s_encoder),
-                  (int)s_speed_dir,
-                  (int)(app_motion_get_pos(&s_motion) * 1000.0f),
-                  (int)(s_motion.pos_ref * 1000.0f),
-                  (int)(app_motion_get_err(&s_motion) * 1000.0f),
-                  (int)s_motion.speed_ref,
-                  (unsigned)bsp_mt6701_get_raw_angle());
+             * 任何一对不同向, 那一对之间的环节就是反的 —— 不用再猜。
+             *
+             * 【延迟格式化】这里只算数(那些 *1000 的软件浮点乘法约 50ns 一次, 无所谓),
+             * 字符串拼装在日志任务里做 —— 见 app_log_format_rec。 */
+            {
+                int32_t a[14];
+
+                a[0]  = (int32_t)(s_ctrl.foc.id * 1000.0f);
+                a[1]  = (int32_t)(s_ctrl.foc.iq * 1000.0f);
+                a[2]  = (int32_t)(s_ctrl.foc.id_ref * 1000.0f);
+                a[3]  = (int32_t)(s_ctrl.foc.iq_ref * 1000.0f);
+                a[4]  = (int32_t)(s_ctrl.foc.ud * 1000.0f);
+                a[5]  = (int32_t)(s_ctrl.foc.uq * 1000.0f);
+                a[6]  = (int32_t)bsp_adc_get_vbus_mv();
+                a[7]  = (int32_t)app_encoder_get_mech_rpm(&s_encoder);
+                a[8]  = (int32_t)s_speed_dir;
+                a[9]  = (int32_t)(app_motion_get_pos(&s_motion) * 1000.0f);
+                a[10] = (int32_t)(s_motion.pos_ref * 1000.0f);
+                a[11] = (int32_t)(app_motion_get_err(&s_motion) * 1000.0f);
+                a[12] = (int32_t)s_motion.speed_ref;
+                a[13] = (int32_t)bsp_mt6701_get_raw_angle();
+                app_defer_push(APP_LR_FOC_LINE, a, 14U);
+            }
 #else
-            LOG_I("FOC", "id=%d iq=%d mA (ref %d/%d) ud=%d uq=%d mV vbus=%d mV rpm=%d sign=%d",
-                  (int)(s_ctrl.foc.id * 1000.0f),
-                  (int)(s_ctrl.foc.iq * 1000.0f),
-                  (int)(s_ctrl.foc.id_ref * 1000.0f),
-                  (int)(s_ctrl.foc.iq_ref * 1000.0f),
-                  (int)(s_ctrl.foc.ud * 1000.0f),
-                  (int)(s_ctrl.foc.uq * 1000.0f),
-                  (int)bsp_adc_get_vbus_mv(),
-                  (int)app_encoder_get_mech_rpm(&s_encoder),
-                  (int)s_cur_sign);
+            {
+                int32_t a[14];
+
+                a[0] = (int32_t)(s_ctrl.foc.id * 1000.0f);
+                a[1] = (int32_t)(s_ctrl.foc.iq * 1000.0f);
+                a[2] = (int32_t)(s_ctrl.foc.id_ref * 1000.0f);
+                a[3] = (int32_t)(s_ctrl.foc.iq_ref * 1000.0f);
+                a[4] = (int32_t)(s_ctrl.foc.ud * 1000.0f);
+                a[5] = (int32_t)(s_ctrl.foc.uq * 1000.0f);
+                a[6] = (int32_t)bsp_adc_get_vbus_mv();
+                a[7] = (int32_t)app_encoder_get_mech_rpm(&s_encoder);
+                a[8] = (int32_t)s_cur_sign;
+                app_defer_push(APP_LR_FOC_LINE, a, 9U);
+            }
 #endif
+                }
+            }
         }
     }
 #endif
@@ -2968,13 +3445,29 @@ void app_run(void)
     }
 #endif
 
-    /* ---- 周期性上报 ---- */
-    if (++tick >= APP_REPORT_TICKS) {
+    /* ---- 周期性上报 (APP_TELEMETRY_ENABLE=0 时整块被编译掉: 这是最贵的一项) ---- */
+    if (APP_TELEMETRY_ENABLE && (++tick >= APP_REPORT_TICKS)) {
         char msg[256];
 
         tick = 0;
 
-#if APP_TELEMETRY_PAIR_ONLY
+#if APP_TELEMETRY_CURRENT_ONLY
+        /* ---- 电流环 CSV: 调 PI 就看这一行 ----
+         *   id_ref, id, iq_ref, iq, ud, uq     [mA, mA, mA, mA, mV, mV]
+         * 每 APP_REPORT_TICKS 行一拍(默认 100Hz); ref 与实测相邻, 相减就是误差。
+         *   误差长时间不为 0      -> Ki 太小(或积分被限幅)
+         *   来回振荡/过冲        -> Kp 偏大, 先减 Kp 再谈 Ki
+         *   |ud,uq| 贴住 Vbus/2  -> 电压饱和, 这时调 gains 没有意义,
+         *                          先解决换向角/限幅(录波里能直接看到)
+         * 想看 20kHz 的瞬态(阶跃响应/失控起点)用 app_scope 的 "SCOPE,..." 行。 */
+        (void)diag_csv_current(msg, sizeof(msg),
+                               (int32_t)(s_ctrl.foc.id_ref * 1000.0f),
+                               (int32_t)(s_ctrl.foc.id * 1000.0f),
+                               (int32_t)(s_ctrl.foc.iq_ref * 1000.0f),
+                               (int32_t)(s_ctrl.foc.iq * 1000.0f),
+                               (int32_t)(s_ctrl.foc.ud * 1000.0f),
+                               (int32_t)(s_ctrl.foc.uq * 1000.0f));
+#elif APP_TELEMETRY_PAIR_ONLY
         /* ---- 极简 CSV: 三个整数 ----
          *   1) 软件(模拟)电角度      mrad, 0..6283
          *   2) 编码器【电角度】       mrad, 0..6283 (含已标定的偏置)

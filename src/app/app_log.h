@@ -115,6 +115,42 @@ void app_log_task_body(void);
  */
 int bsp_console_write(const char *data, int size);
 
+/* ================= 延迟格式化日志 (控制任务热路径专用) =================
+ *
+ * 【为什么需要】LOG_*() 的 vsnprintf 是在【调用者上下文】里跑的 —— 控制任务自己
+ * 打日志时, 这笔开销就记在控制任务头上(见 app_log.c 里 app_log_write 的实现)。
+ * 实测每秒那几条长日志(ctrl period / ADC ISR / 电流环峰峰值 / FOC 状态行, 合计
+ * 约 500 字符、25 个转换)会在【同一拍】里连续格式化, 让那一拍多花 100~200us,
+ * 占 1ms 周期的 10~20% —— 外环(速度/位置)晚一拍, 现象就是"打印一下电机顿一下"。
+ *
+ * 用法: 控制任务只把【已经算好的整数】塞进 app_log_rec_t 投递(约 0.3us),
+ *       真正的 snprintf 交给日志任务。格式串仍然留在消息所在的那份文件中
+ *       (用 app_log_set_formatter 注册一个回调即可)。
+ *
+ * 注意: 浮点参数请先自己定标成整数(例如 (int)(id * 1000.0f)), 因为这个结构体
+ *       只装 int32_t —— 一次软件浮点乘法约 50ns, 和 vsnprintf 比可以忽略。
+ */
+#define APP_LOG_REC_MAX_ARGS   (16)
+
+typedef struct {
+    uint16_t id;                        /* 消息编号, 由格式化回调解释 */
+    uint8_t  n;                         /* 有效参数个数(<= APP_LOG_REC_MAX_ARGS) */
+    int32_t  a[APP_LOG_REC_MAX_ARGS];   /* 参数(整数) */
+} app_log_rec_t;
+
+/** 格式化回调: 由【日志任务】调用, 把 rec 拼成一整行(含 "[INFO] [TAG] " 前缀, 不含换行) */
+typedef void (*app_log_fmt_fn_t)(const app_log_rec_t *rec, char *out, uint32_t out_sz);
+
+/** 注册格式化回调 (启动时调一次) */
+void app_log_set_formatter(app_log_fmt_fn_t fn);
+
+/**
+ * @brief  投递一条"延迟格式化"的日志 —— 可以从控制任务里调, 开销约 0.3us
+ * @return 1 = 已入队; 0 = 队列满被丢弃(或退化成立刻格式化)
+ * @note   非阻塞。队列满直接丢, 绝不等待。
+ */
+int  app_log_post(const app_log_rec_t *rec);
+
 /* ---- 便捷宏: LOG_[级别](模块TAG, 格式串, ...) ---- */
 #if APP_LOG_LEVEL <= APP_LOG_LVL_DEBUG
 #define LOG_D(tag, fmt, ...)  app_log_write(app_log_debug, tag, fmt, ##__VA_ARGS__)

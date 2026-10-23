@@ -57,11 +57,24 @@ static uint32_t s_adc_u_buff[BOARD_BLDC_ADC_PMT_DMA_SIZE_IN_4BYTES];
 ATTR_PLACE_AT_NONCACHEABLE_WITH_ALIGNMENT(ADC_SOC_DMA_ADDR_ALIGNMENT)
 static uint32_t s_adc_v_buff[BOARD_BLDC_ADC_PMT_DMA_SIZE_IN_4BYTES];
 
+/* 【为什么放 noncacheable 段】这 4 个量是调试时"边跑边看"的观测量。
+ * 默认的 .bss 落在 AXI_SRAM(0x0120xxxx), 是【带 D-Cache】的区域:
+ * 20kHz 中断里反复写这几个字, 脏行长期不回写, 于是任何"不停机读内存"的调试手段
+ * (Cortex-Debug 的 Live Watch、OpenOCD 的 mdw/SBA)只能读到 AXI SRAM 里的陈旧副本
+ * ——表现为"数值一直不变"(实测帧计数缓存里 710 万, RAM 里才 76 万)。
+ * 放到 noncacheable 段后(board_init_pmp() 已把该区 PMA 配成 MEM_NON_CACHE_BUF),
+ * CPU 写直达 0x01280000 起的 AXI SRAM, 全速运行时也能被调试器读到真实值。
+ * 代价: 每次访问慢几拍(非缓存), 对 20kHz 中断约 0.1% CPU, 可忽略。
+ * 注意: 以后想让别的变量也能 Live Watch, 照这个加属性即可。 */
+ATTR_PLACE_AT_NONCACHEABLE_BSS
 static volatile uint16_t s_cur_u_raw;
+ATTR_PLACE_AT_NONCACHEABLE_BSS
 static volatile uint16_t s_cur_v_raw;
+ATTR_PLACE_AT_NONCACHEABLE_BSS
 static volatile bool s_cur_ready;
 /* 采样帧计数: 每完成一次 PWM 触发的电流采样 +1。
  * 零点校准必须"等新样本"再取, 不能紧循环连读 —— 那样读到的是同一个值。 */
+ATTR_PLACE_AT_NONCACHEABLE_BSS
 static volatile uint32_t s_cur_frame;
 
 /* 应用层注册的电流采样完成回调 (中断上下文调用) */
@@ -233,9 +246,17 @@ static hpm_stat_t bsp_adc_init_current(void)
     adc16_enable_pmt_queue(BSP_ADC_CUR_U_BASE, BSP_ADC_TRG);
     adc16_enable_pmt_queue(BSP_ADC_CUR_V_BASE, BSP_ADC_TRG);
 
-    /* ---- 开中断并使能 NVIC ---- */
+    /* ---- 开中断并使能 NVIC ----
+     * 【优先级必须是 7, 不能是 1】HPM 的 PLIC 与 RISC-V 一致: 数值【越大】优先级越高,
+     * 而且"优先级 > 阈值"才会被投递。FreeRTOS 临界区把阈值设成
+     * configMAX_SYSCALL_INTERRUPT_PRIORITY(=4, 见 src/rtos/FreeRTOSConfig.h),
+     * 于是优先级 ≤4 的中断在临界区里【全被屏蔽】。
+     *   原来写 1 -> 电流环在每次 RTOS 临界区里被挡掉, 实测每次日志突发都出现
+     *   "ADC 中断被拖长 260~300us"(= 5~6 个 PWM 周期占空比冻结), 电机因此
+     *   "跳一下", 而且 300Hz 带宽的电流环被这种抖动打成自激振荡。
+     * 电流环不调用任何 RTOS API, 所以可以(也必须)放在阈值之上: 用最高级 7。 */
     adc16_enable_interrupts(BSP_ADC_CUR_U_BASE, BSP_ADC_TRIG_FLAG);
-    intc_m_enable_irq_with_priority(BSP_ADC_IRQn, 1);   /* 优先级 1, 需早于普通任务响应 */
+    intc_m_enable_irq_with_priority(BSP_ADC_IRQn, 7);
 
     return status_success;
 }

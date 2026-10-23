@@ -138,12 +138,59 @@ extern "C" {
 
 /* ADC 采样存活看门狗 (始终生效, 不可关): 中断次数掉到期望值的 1/4 以下就封锁输出并报警。
  * 期望值按【实测主循环周期累加出的真实窗口时长】算, 不假设窗口就是 1 秒。 */
+/* ================= 调试输出总开关 (出厂固件全关) =================
+ *
+ * 【为什么要有这一块】这些打印全都是"调参时才需要"的, 实际跑车/出厂一件都不要:
+ *   - 周期性 CSV 是 100Hz 的, 每行一次 snprintf + 一次日志入队 —— 实测控制环
+ *     被这些输出拖到 avg=2.1ms(该 1.0ms), 电流环峰值从几十 mA 涨到 600mA;
+ *   - FOC 状态行 14 个参数、编码器体检行 185 字符, 每秒/每 5 秒在控制任务里
+ *     各来一次长 snprintf。
+ * 关掉它们【不改变任何控制行为】, 只是把 CPU 和串口还给控制环。
+ *
+ * 用法:
+ *   出厂/实际应用      : 什么都不用加 (默认 APP_DEBUG_ALL = 0)
+ *   调参时全打开        : -DAPP_DEBUG_ALL=1
+ *   只开某一项          : -DAPP_LOG_IQ_RIPPLE=1   (其余仍关)
+ */
+#ifndef APP_DEBUG_ALL
+#define APP_DEBUG_ALL               (0)
+#endif
+
 /* 每秒打印一行 ADC 中断统计 (实测次数 / 期望次数 / 最大间隔 us):
- *   0 = 【默认】不打。那些数字受主循环实际周期影响, 正常时看着也像故障, 容易误判;
- *       真出问题时看门狗自己会报。
  *   1 = 排障用。查"电流环被卡住/电流环失准"时打开: 最大间隔远大于 50us
  *       就说明中断被别的 ISR 或临界区拖住了(实测见过 15ms)。 */
-#define APP_LOG_ISR_STAT            (1)
+#ifndef APP_LOG_ISR_STAT
+#define APP_LOG_ISR_STAT            (APP_DEBUG_ALL)
+#endif
+
+/* 电流环 1s 峰峰值 (idpp/iqpp): 判据是"几十 mA 正常, 几百 mA 以上=自激"。
+ * 调电流环 PI 时最有用的一行。 */
+#ifndef APP_LOG_IQ_RIPPLE
+#define APP_LOG_IQ_RIPPLE           (APP_DEBUG_ALL)
+#endif
+
+/* FOC 状态行 (id/iq/ud/uq/rpm/pos/err/raw ..., 14 个参数、约 150 字符)。
+ * 查速度环/位置环时看它; 实际应用关掉。 */
+#ifndef APP_LOG_FOC_LINE
+#define APP_LOG_FOC_LINE            (APP_DEBUG_ALL)
+#endif
+
+/* [ENC] 编码器体检行 (185 字符, 每 APP_ENC_HEALTH_MS 一次)。
+ * 只在查编码器接线/丢帧时需要。 */
+#ifndef APP_LOG_ENC_HEALTH
+#define APP_LOG_ENC_HEALTH          (APP_DEBUG_ALL)
+#endif
+
+/* 按键电平行 (5s 一次): 只在查按键接线时需要。 */
+#ifndef APP_LOG_BTN_LEVEL
+#define APP_LOG_BTN_LEVEL           (APP_DEBUG_ALL)
+#endif
+
+/* 周期性 CSV 上报 (电流环 6 列 / 电角度+编码器 3~4 列, 由 APP_TELEMETRY_* 选模式)。
+ * 默认 100Hz —— 【这一项是全部调试输出里最贵的】, 调 PI、查换向角时才开。 */
+#ifndef APP_TELEMETRY_ENABLE
+#define APP_TELEMETRY_ENABLE        (APP_DEBUG_ALL)
+#endif
 
 /* ================= 控制任务节拍体检 =================
  *
@@ -156,7 +203,9 @@ extern "C" {
  *       (表现就是电机堵转/顿挫)。这行就是用来证明/排除这件事的。
  *
  *   0 = 不打印 (稳定后可以关掉)。 */
-#define APP_LOG_CTRL_PERIOD        (1)
+#ifndef APP_LOG_CTRL_PERIOD
+#define APP_LOG_CTRL_PERIOD         (APP_DEBUG_ALL)
+#endif
 
 /* 控制周期超过这个值 (ms) 就计一次 bad, 并在日志里把最大值打出来。
  * 1kHz 的环路上, 单拍超过 2ms 已经足以让 300RPM 的转子丢拍。 */
@@ -194,15 +243,28 @@ extern "C" {
  *       Kp = Ls·ωc = 2.45 V/A,  Ki = Rs·ωc = 5844 V/(A·s) */
 #define APP_FOC_CLOSED_LOOP_ENABLE  (1)
 
-#define APP_FOC_ID_REF_A            (0.0f)    /* d 轴电流给定 (A), 通常为 0 */
+/* 【本轮隔离实验用 d 轴电流】d 轴电流不产生力矩 -> 转子原地不动, 而电流环
+ * 实实在在在调一个 0.3A 的静止电流 —— 这才是"只测电流环"的正确姿势。
+ * (之前想过用 iq=0.3A 恒定, 但那是恒力矩, 电机会被它一路转走, 电流就不静止了。) */
+#define APP_FOC_ID_REF_A            (0.0f)
 /* q 轴电流给定 (A)。实测视在相电阻约 3.1Ω, 0.3A 只要约 1V, 是安全的起步点;
- * 想加力就往上加 (注意 foc_config.h 的 FOC_CURRENT_LIMIT_A=2A 会夹住给定)。 */
+ * 想加力就往上加 (注意 foc_config.h 的 FOC_CURRENT_LIMIT_A=2A 会夹住给定)。
+ * 【本轮隔离实验: 置 0, 让速度环关闭时 iq=0, 只有 d 轴有电流】 */
 #define APP_FOC_IQ_REF_A            (0.3f)
 /* 电流环增益: 必须与"跑在哪里"配套 —— 中断里 ts=50us, 主循环里 ts=1ms,
- * 同一组数换环境用会差 20 倍(积分), 直接振荡。所以这里按开关自动选。 */
+ * 同一组数换环境用会差 20 倍(积分), 直接振荡。所以这里按开关自动选。
+ *
+ * 【2026-10-20: 这里不再写死数值, 直接引用 foc_config.h 的唯一整定入口】
+ *   原来这里硬编了 ωc=300Hz 那一组 (2.45 / 5844), 而 foc_config.h 里
+ *   FOC_DEFAULT_CURRENT_KP/KI 已经从 300Hz 一路降到 100Hz、60Hz(0.49/1169) ——
+ *   可 app.c 用的是【本文件这两个宏】, 于是那边所有降带宽的改动对实际运行的
+ *   环路一点作用都没有。改参数却不见效果, 就是这么来的。
+ *   现在 Kp/Ki 只有一处定义: foc_config.h 的 FOC_CURRENT_BW_HZ
+ *       Kp = Ls·ωc,  Ki = Rs·ωc   (必须同比例改, 见那边注释)
+ *   想把带宽提回去就只改 FOC_CURRENT_BW_HZ。 */
 #if APP_CURRENT_LOOP_IN_ISR
-#define APP_FOC_CURRENT_KP          (2.45f)   /* ts=50us,  ωc=300Hz: Ls*ωc */
-#define APP_FOC_CURRENT_KI          (5844.0f) /* ts=50us,  ωc=300Hz: Rs*ωc */
+#define APP_FOC_CURRENT_KP          (FOC_DEFAULT_CURRENT_KP)  /* = Ls·ωc, 见 foc_config.h */
+#define APP_FOC_CURRENT_KI          (FOC_DEFAULT_CURRENT_KI)  /* = Rs·ωc, 见 foc_config.h */
 #else
 #define APP_FOC_CURRENT_KP          (0.33f)   /* ts=1ms,  ωc=40Hz (旧路径) */
 #define APP_FOC_CURRENT_KI          (779.0f)
@@ -241,7 +303,51 @@ extern "C" {
  *   "位置环"一节。位置环每拍都会重写速度给定, 所以"上电 600RPM"的默认目标
  *   不会真的让电机去追 600; 若把 APP_MOTION_ENABLE 设回 0 又不想让电机自转,
  *   记得把这里也改回 0。 */
+/* 【2026-10-18 打开】位置环的输出 spdref 只写进 app_speed_target_set(), 而消费它的
+ * 只有速度环。速度环=0 时 iq 走的是 "固定的 APP_FOC_IQ_REF_A(0.3A) + 软限速" 那一支,
+ * 于是位置环等于被开环: 电机被 0.3A 恒力矩一路转走, pos 从 2412 涨到 20000,
+ * spdref 却是正常的(和 err×1.2 精确吻合) —— 现象就是"位置环根本没生效"。
+ * 要用位置环, 这个必须是 1。 */
+/* ============ 本轮: 电流环隔离实验版 (2026-10-18) ============
+ * 目的: 用户反馈"速度环时没声音, 位置环才有" —— 说明啸叫不是位置环的增益问题,
+ *       而是电流环一旦真的调非零电流就振。这里把两个外环都关掉, 让电流环
+ *       单独调一个【静止的 0.3A】: 没有位置环/速度环参与, 唯一可能的声源就是电流环。
+ *   判读(看每秒新打出的 "电流环 1s 峰峰值"):
+ *     有啸叫 + idpp/iqpp 几百 mA  -> 确认是电流环, 继续降带宽/加低通;
+ *     没声音 + 峰峰值几十 mA      -> 电流环没问题, 声源在外环, 回头查位置环。
+ * 【做法】用 d 轴电流而不是 q 轴: id_ref=0.3A / iq_ref=0, d 轴不产生力矩,
+ *   转子原地不动, 但电流环确实在调一个静止的 0.3A -> 声源唯一。
+ * 【实验做完把下面三个改回来】SPEED_LOOP_ENABLE=1 / MOTION_ENABLE=1 /
+ *   ID_REF_A=0 / IQ_REF_A=0.3。 */
 #define APP_FOC_SPEED_LOOP_ENABLE   (1)
+
+/* ---- 电流环阶跃测试 (专门用来调电流 PI) ----
+ * 【放在 #if APP_FOC_SPEED_LOOP_ENABLE 外面】速度环关掉时也照样能用 ——
+ * 那正是"只调电流环"的场景。原来写在速度环那个 #if 里面, 一关速度环这个
+ * 开关就跟着消失, app.c 里的 #if APP_IQ_STEP_TEST_ENABLE 会报 -Wundef。
+ *
+ * 1 = 完全【旁路位置环/速度环】, 直接给 iq 一个方波:
+ *         0 -> +APP_IQ_STEP_AMP_A -> 0 -> -APP_IQ_STEP_AMP_A -> 0 ...
+ *     调 Kp/Ki 看它的上升时间、过冲、稳态误差。
+ * 0 = 正常闭环(位置环 -> 速度环 -> 电流环)。
+ *
+ * 【幅值必须小, 这是硬件决定的】实测这台电机相电阻约 3.1Ω: 推 1.5A 就要
+ *   1.5×3.1 = 4.65V, 而电压天花板是 vdc/√3×0.85 ≈ 5.9V。0.3A 只占约 1V,
+ *   环路才有干净的线性区可看。
+ *
+ * 【顺便当方向自检】+iq 段里编码器 raw 应朝一个固定方向单调走; 若与 iq 符号
+ *   相反, 就是"力矩方向/电流符号"那条链反了(APP_SPEED_DIR_SIGN / APP_CURRENT_SIGN)。 */
+#define APP_IQ_STEP_TEST_ENABLE     (0)
+#define APP_IQ_STEP_AMP_A           (0.3f)   /* 方波幅值 (A) */
+#define APP_IQ_STEP_HALF_MS         (200U)   /* 半周期 (ms): 200 -> 2.5Hz */
+
+/* 方向系数兜底: app.c 里 `static float s_speed_dir = APP_SPEED_DIR_SIGN;` 是
+ * 【无条件】的, 而正式定义在下面 #if APP_FOC_SPEED_LOOP_ENABLE 块里 ——
+ * 速度环一关(=0)整棵 app.c 就编不过(error: 'APP_SPEED_DIR_SIGN' undeclared)。
+ * 这里给同值兜底; 速度环打开时以块内那份为准(同值, 不会 redefined 警告)。 */
+#ifndef APP_SPEED_DIR_SIGN
+#define APP_SPEED_DIR_SIGN          (1.0f)
+#endif
 
 #if APP_FOC_SPEED_LOOP_ENABLE
 /* 【速度环是位置环的内环, 它自己不该成为用户感知到的模式】
@@ -260,6 +366,13 @@ extern "C" {
  * 与 FOC_ENCODER_DIRECTION 叠加后容易再次反号(之前连续几次飞车就是这原因)。
  * 只有将来换了编码器安装方向(FOC_ENCODER_DIRECTION 改了)又想自动确认时,
  * 才临时把它改回 1。 */
+/* 【2026-10-18 改回 0: 符号已由运行数据确认正确, 不再需要上电自检】
+ * 判据: 日志里 iq_ref 的符号【始终与 rpm 反号】(rpm=-107 -> iq_ref=+1500;
+ * rpm=+104 -> iq_ref=-1500), 说明环路在正常刹车 —— 若力矩方向反了, 转速会
+ * 单向飞车(两小时前那次), 而不是绕 0 来回摆。所以 s_speed_dir 保持静态 +1 是对的。
+ * 【为什么宁可不测】它靠一次 120ms 开环脉冲判方向, 转子被齿顶住/速度估计跟不上
+ * 就会判错 —— 你们之前几次飞车就是它引起的。代码和延迟路径里的调用都保留,
+ * 需要验证时置 1 即可(会打出实测的 raw 走向)。 */
 #define APP_SPEED_DIR_AUTOTEST      (0)
 
 /* 速度环 PI (1kHz 下发, ts = 1ms)。
@@ -279,10 +392,31 @@ extern "C" {
  *   同时离 1.5A 限幅还有余量。
  * 【调法】先只保留 P(把 KI 置 0)调到"能追但不持续抖", 再加 Ki 消静差;
  *   抖就同时减, 追不上就先加 Kp。 */
-#define APP_FOC_SPEED_KP            (0.05f)
+/* 【2026-10-18 Kp 0.02 -> 0.004: 带宽必须落在速度反馈滤波之下】
+ * 速度反馈是 alpha=0.1 @1kHz 的一阶低通 -> τ=10ms -> 截止 ≈16Hz。
+ * 速度环闭环极点 = 9549×Kp [rad/s]  (由 Kt/J≈1000 rad/s²/A、RPM↔rad/s 换算得来):
+ *    Kp=0.02  -> τ=5.2ms -> 带宽 30Hz  > 16Hz  -> 控制一个自己看不快的量 -> 自激
+ *    Kp=0.004 -> τ=26ms  -> 带宽  6Hz  < 16Hz  -> 稳定
+ * 实测印证: Kp=0.02 时 iq 顶在 ±1.5A、转速 ±145RPM 原地剧烈震荡(而且摆幅随限幅
+ * 线性增大 —— 那是"带宽过高 + 饱和"的限幅环, 不是符号反; 符号从日志已确认正确:
+ * iq_ref 始终与 rpm 反号, 在刹车)。
+ * 另外 1A 就能让这台电机 1ms 变 9.5RPM, 所以限幅 1.5A 时环路很容易进饱和,
+ * 增益必须按"不饱和"来定。 */
+#define APP_FOC_SPEED_KP            (0.004f)
 #define APP_FOC_SPEED_KI            (0.06f)
 /* 速度环输出的 iq 幅值上限 (A)。必须 <= APP_FOC_OC_LIMIT_A, 否则速度环会
  * 自己把电流顶到过流保护上去。 */
+/* 【先压到 0.5A 做方向首测】速度环一打开, s_speed_dir 这条方向链(编码器方向 ×
+ * 电流极性 × 换向角)就第一次真正受考验。0.5A 限幅下即使方向反了, 最坏电流也只有
+ * 0.5A(远低于 2A 过流点), 表现是"慢慢漂"而不是"满力冲 + 过流锁死", 好判读。
+ * 确认方向对之后再提回 1.5A。 */
+/* 【2026-10-18 回退到 1.5A —— 0.5A 会逼出 bang-bang 极限环】
+ * 速度环是 P 控制: 输出 = Kp×误差。线性区 = 限幅/Kp。
+ *   0.5A / 0.05  = ±10 RPM   <- 电机原地以 ±50 RPM 振, 误差全在线性区外
+ *                               -> 每拍都饱和, iq_ref 只能 ±500 来回打
+ *                               -> 表现为"原地强烈震荡"(实测 CSV: iq_ref 每 10ms 翻一次)
+ *   1.5A / 0.02  = ±75 RPM   <- 覆盖实际摆动幅度, 环路才回到线性区
+ * 结论: 限幅和 Kp 必须一起看, 只压限幅会把环路逼成开关控制。 */
 #define APP_FOC_SPEED_IQ_LIMIT_A    (1.5f)
 
 /* ---- 速度环反馈方向 ----
@@ -340,11 +474,28 @@ extern "C" {
  * 开环电频率一步跳过去 (转子跟不上 -> 失步/过流折叠), 速度环也会吃到巨大的
  * 阶跃误差。所以下发给开环频率给定前先按这个速率爬。600 RPM 满量程约 1.2s。
  * 调试时想看阶跃响应, 改成很大的值 (例如 1.0e9f) 即可。 */
-#define APP_SPEED_RAMP_RPM_S        (500.0f)
+#define APP_SPEED_RAMP_RPM_S        (1500.0f)
+/* 【2026-10-24 从 500 提到 1500】原来 500 RPM/s 是"跟踪慢"的主因, 不是 PI:
+ * 600->300 这 300 RPM 的变化, 光爬完斜坡就要 300/500 = 0.6 秒, 占了你实测 1 秒
+ * 里的一大半。而且斜坡是加在【目标值】上的 —— 速度环每拍看到的是斜线不是阶跃,
+ * 环再快也只能跟着这条线走。
+ *
+ * 【斜坡到底在保护什么】限制加速度 -> 限制加速电流。本机 12V/3.1Ω/1.3mH,
+ * 电流环过流门限约 2000mA。1500 RPM/s = 157 rad/s², 对这个小转子是安全的;
+ * 500 -> 1500 之后 300 RPM 的阶跃约 0.2s 爬完(原来 0.6s)。
+ *
+ * 【调法】想要"立刻响应"就开到 5000~10000, 这时限制速度的变成电流环和过流门限。
+ *   调太高的症状: 加速瞬间听到"咚"一下、或直接 OVERCURRENT 锁死 —— 那就往回退。
+ *   想把响应再加快但斜坡不想动: 那是速度环 PI 的事, 不在这个宏。 */
 /* 软限速的拐点: 从 RPM_LIMIT×这个比例 开始线性减弱 iq, 到 RPM_LIMIT 减到 0。
  * 原来是"超过 90% 砍到 30%"的开关式, 实测把转速打成了 86~143RPM 的来回冲
  * (0.3A 转矩每毫秒能把这个小惯量转子变速 26RPM), 转动震动明显。 */
-#define APP_FOC_RPM_KNEE            (0.5f)
+#define APP_FOC_RPM_KNEE            (0.8f)
+/* 【2026-10-24 从 0.5 提到 0.8】0.5 表示"从 500 RPM 起就开始砍 iq", 于是
+ * 0->600 的最后 100 RPM 只有 80% 的电流可用, 表现就是"越接近 600 越慢"。
+ * 0.8 让拐点上移到 800 RPM: 600 RPM 时仍然是满电流 1.5A, 只用 800~1000 这段
+ * 做衰减(防止冲过软限速)。留 0.4 是因为这个拐点原本就是为"防 86~143RPM 来回冲"
+ * 加的(见下面的历史说明), 不能直接取消。 */
 
 /* ================= 位置环 (外环) =================
  *
@@ -361,7 +512,7 @@ extern "C" {
  *   内环(速度)按 ωc≈10Hz 设计, 则位置环取 2π×5Hz = 31.4 rad/s。
  *   而速度给定的单位是 RPM, 所以 pos_kp [RPM/rad] = 31.4/9.549 ≈ 3.3, 取 3.0。
  *   若响应太软就按比例加大, 出现超调/来回摆就减小(优先调这个, 不用碰内环)。 */
-#define APP_MOTION_ENABLE           (1)        /* 0 = 完全不用位置环(回到原行为) */
+#define APP_MOTION_ENABLE           (1)        /* 1 = 位置环使能; 电流环隔离实验已结束 */
 
 /* 位置环增益 [RPM / rad]。
  *
@@ -378,14 +529,39 @@ extern "C" {
  *   到位太慢 / 软绵绵   -> 加大 (2.0 / 3.0)
  *   到位后来回摆 / 嗡嗡  -> 减小 (0.8 / 0.5)
  *   先调它, 不要一上来动速度环。 */
-#define APP_MOTION_POS_KP           (1.2f)     /* (rad 误差) -> RPM */
+#define APP_MOTION_POS_KP           (20.0f)    /* (rad 误差) -> RPM *//* 【2026-10-24 从 1.2 提到 20】原来 1.2 RPM/rad 等于位置环躺平: 日志里
+ * err=4012 mrad(4 弧度!) 只给出 spdref=4 RPM, 表现就是"跟踪很差、推一下回不来"。
+ * 位置环是速度环的外环, 带宽必须【明显低于】内环: 位置环带宽 ≈ pos_kp [rad/s],
+ * 20 rad/s ≈ 3.2Hz, 对 60RPM 限幅 + 下面那个速度环是合适的量级。
+ * 调法: 先 20 看能不能守住 -> 到目标后来回摆/过冲就往下调到 10 或 5;
+ *       到得慢、推得动就往上加(上限到速度限幅一直饱和为止)。 */
 
 /* 位置死区 [rad]。误差小于它时速度给定直接给 0。
  * 【为什么必须有】编码器 14bit, 1 count ≈ 0.38 mrad; 位置环在目标附近会一直
- * 追这最后几个 count, 表现为"到位后轻微嗡嗡/抖动"。给 4 mrad(约 0.23°)
- * 的死区就能让它真正停住, 而这个角度对位置精度没有实际影响。
- * 死区外的控制律不变(仍是 P), 所以不会引入额外滞后。 */
-#define APP_MOTION_DEADBAND_RAD     (0.004f)   /* ±4 mrad ≈ ±0.23° */
+ * 追这最后几个 count, 表现为"到位后轻微嗡嗡/抖动"。死区让环路主动停手。
+ * 死区外的控制律不变(仍是 P), 所以不会引入额外滞后。
+ *
+ * 【2026-10-23 从 4 mrad 降到 1.5 mrad —— "停下来差一点"的直接原因】
+ *   4 mrad = 0.23°, 在 5° 的按键步距上就是 4.6% 的偏差。更要紧的是它是
+ *   【硬地板】: 误差一进死区 speed_ref 直接归零, 环路不再修 —— 所以这个
+ *   偏差无论怎么加大 pos_kp 都消不掉(pos_kp 只影响"到得快不快/抗推硬不硬",
+ *   不影响最终停在哪)。稳态误差先查死区, 再去查机械回差。
+ *   1.5 mrad = 0.086°, 约 4 个 count, 仍留 4 倍于 ±1 count 编码器噪声的余量,
+ *   不会退化成"追噪声嗡嗡"。理论下限是 1 count = 0.383 mrad = 0.022°。 */
+#define APP_MOTION_DEADBAND_RAD     (0.0015f)  /* ±1.5 mrad ≈ ±0.086° (约 4 count) */
+
+/* 【最小逼近速度】|kp*err| 比它小的时候, 直接给一个固定大小的速度 (RPM)。
+ *
+ * 【为什么必须有它】纯 P 律 spdref = kp*err 在接近目标时输出趋近 0, 而电机在
+ * 几 RPM 以下【根本转不动】(静摩擦 + 速度环低速死区 + 编码器量化), 于是最后
+ * 一段变成"爬"甚至停在差一点的位置 —— 现象就是"越接近越慢, 最后差一点到不了"。
+ * 给它一个最小速度顶过去, 再由上面的死区干净地停住 —— 这一对就是"到位干脆"
+ * 的全部秘密。
+ *
+ * 【量级】太小(0.5)顶不动静摩擦; 太大(15)会在目标附近来回撞(过冲->反向->再过冲)。
+ *         3~5 RPM 是本机(12V/3.1Ω/1.3mH)的经验值。
+ * 【必须 < APP_MOTION_SPEED_LIMIT_RPM】否则限速会被它顶穿。 */
+#define APP_MOTION_APPROACH_MIN_RPM (3.0f)
 
 /* 位置环输出的速度限幅 (RPM)。
  *
@@ -714,11 +890,13 @@ extern "C" {
  *   foc_controller_set_dt), 所以磁场频率不会因此漂移。 */
 #define APP_REPORT_TICKS            (10U)
 
-/* 遥测内容开关 (三选一, 按优先级从上到下):
+/* 遥测内容开关 (四选一, 按优先级从上到下):
+ *   APP_TELEMETRY_CURRENT_ONLY = 1 -> 【电流环】id_ref,id,iq_ref,iq,ud,uq
+ *                                     (调 PI 看这一行; 细看瞬态用 SCOPE 录波)
  *   APP_TELEMETRY_PAIR_ONLY = 1 -> 每行只有两个整数 "软件电角度,编码器值"
  *                                  (无任何标签, 便于直接喂给绘图/脚本)
  *   APP_TELEMETRY_CAL_ONLY  = 1 -> 校准用 4 个数 SW/ENC/ENCEL/DIFF
- *   两个都是 0                  -> 完整运行遥测
+ *   都是 0                      -> 完整运行遥测
  *
  * 【重要: 格式串里不要加 "\r\n"】
  *   log_backend_console() 是 printf("%s\r\n", line),
@@ -726,7 +904,12 @@ extern "C" {
  *   两个后端【都已经补了 CRLF】。若格式串里再带一次, 串口上每行后面就会多出
  *   一个空行 —— 这正是早期"打印隔那么多行"那个 bug。所以只写 "%d,%d",
  *   最终线路上收到的依然是标准的 "%d,%d\r\n"。 */
-#define APP_TELEMETRY_PAIR_ONLY     (1)   /* 日志要短, 便于抄 LUT 转储 */
+
+/* 【2026-10-18 切换】电角度/查表那套已经调完(LUT 与编码器周期误差都收敛了),
+ * 现在只调电流环, 所以打开 CURRENT_ONLY、关掉电角度输出。
+ * 想回去看角度就把两个开关对调(APP_TELEMETRY_CURRENT_ONLY 置 0 即可)。 */
+#define APP_TELEMETRY_CURRENT_ONLY  (1)   /* 只打电流环 6 个数 */
+#define APP_TELEMETRY_PAIR_ONLY     (0)   /* 电角度 CSV: 已调完, 关掉 */
 /* APP_TELEMETRY_PAIR_ONLY 时第二个数打印什么:
  *   1 = 编码器【电角度】 mrad (0..6283, 含已标定的 FOC_ELEC_ANGLE_OFFSET)
  *       -> 与第一个数同量纲、可直接相减看负载角
@@ -736,11 +919,34 @@ extern "C" {
 /* APP_TELEMETRY_PAIR_ONLY 时是否追加第 4 列: 查表法(LUT)得到的电角度。
  *   1 = 输出 "sw,enc_elec,enc_raw,lut" 四列
  *       lut = diag_lut_angle(enc_raw), 表项无效时打 -1
- *   0 = 维持原来的三列 "sw,enc_elec,enc_raw" */
-#define APP_TELEMETRY_LUT           (1)
+ *   0 = 维持原来的三列 "sw,enc_elec,enc_raw"
+ * 【现已置 0】电角度那套调完了, 遥测已切成电流环(CURRENT_ONLY), 这一项不再用;
+ * 要回去看角度就把 PAIR_ONLY 重新置 1、这里按需选。 */
+#define APP_TELEMETRY_LUT           (0)
 
 /* 校准用 4 个数 (软件电角度 / 编码器原始角 / 编码器电角度 / 残差) */
 #define APP_TELEMETRY_CAL_ONLY      (0)
+
+/* ---- 日志负担开关 (调电流环时用) ----
+ *
+ * 【为什么需要】日志这条路【没有 DMA】: 控制任务 snprintf -> FreeRTOS 队列
+ *   (xQueueSend 超时 0, 满就丢, 不阻塞控制任务) -> 日志任务 -> 4KB 环形缓冲
+ *   -> UART TX FIFO 中断。真正用 DMA 的是 LCD 的 SPI1 刷屏(而且在 core1 上)。
+ *
+ * 【串口时间怎么算】板子已经把波特率提到 921600(见 board.h: BOARD_CONSOLE_UART_BAUDRATE)
+ *   = 92 字符/ms:
+ *     [FOC] 状态行   132 字符 -> 1.4ms
+ *     1Hz 那组三行   约 250 字符 -> 2.7ms
+ *     5s 的 [LCD]/[ENC] 两行 约 250 字符 -> 2.7ms
+ *   于是"每秒/每5秒 卡一下, 5ms 量级"就是这些字符在串口线上排队, 不是 CPU 卡住;
+ *   排在后面的 100Hz CSV 只能等, 看起来就是遥测少了几行。
+ *
+ * 【更要紧的副作用】这些日志由日志任务发出, 而本工程 FreeRTOS port 的中断不嵌套
+ *   (portASM 在 ISR 里不复位 MIE), 日志任务里的 USB 提交会把 20kHz 的 ADC 中断
+ *   推迟 ~250us —— 日志里每条 "!! ADC 中断被拖长" 都紧跟着 1Hz 日志行。300Hz
+ *   带宽的电流环扛不住这种抖动, 会表现为电流环自激振荡。调电流环前先压日志。 */
+#define APP_LOG_USB_ENABLE       (1)    /* 0 = 关掉 USB 日志后端(只走串口), 少一半日志工作 */
+#define APP_LOG_FOC_EVERY_N      (1)    /* [FOC] 状态行每 N 秒打一次: 调参时建议 5 或 10 */
 
 /**
  * @brief  初始化整个应用 (外设 + FOC + 编码器 + 日志 + 回调注册)

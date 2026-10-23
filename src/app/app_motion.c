@@ -97,6 +97,17 @@ void app_motion_enable(app_motion_t *m, bool enable, float mech_rad)
     if (m == NULL) {
         return;
     }
+
+    /* 【防呆: 增益还是 0 就先自愈】
+     * 实测坑: 延迟自检那条路径直接调 app_motion_enable(), 却没先调
+     * app_motion_init() —— pos_kp/speed_limit 停在 .bss 的 0, P 律
+     * clamp(kp*err, 0) 恒等于 0: 环"使能"了却永远不出力(日志: err 涨到
+     * 20~85 rad 而 spdref 恒为 0, 电机只剩速度环自己守 0 转速 -> 漂走 -> 过流)。
+     * 这里补一道自愈, 让"忘了 init"不再能悄悄地废掉位置环。 */
+    if ((m->speed_limit <= 0.0f) || (m->pos_kp <= 0.0f)) {
+        app_motion_init(m);
+    }
+
     if (enable && !m->enable) {
         m->unwrap_valid = false;                      /* 重新建立展开基准 */
         m->pos_fb       = motion_dir() * motion_unwrap(m, motion_wrap_2pi(mech_rad));
@@ -147,6 +158,15 @@ float app_motion_run(app_motion_t *m, float mech_rad)
         m->speed_ref = 0.0f;
     } else {
         m->speed_ref = motion_clamp(m->pos_kp * err, m->speed_limit);
+        /* 【最小逼近速度】纯 P 律在接近目标时输出趋近 0, 而电机几 RPM 以下转不动,
+         * 最后一段就变成"爬"。误差还在死区外, 就给一个最小速度把它顶过去;
+         * 进了死区上面那个分支会干净地停住。见 app.h 的说明。 */
+        if ((APP_MOTION_APPROACH_MIN_RPM < m->speed_limit) &&
+            (m->speed_ref > -APP_MOTION_APPROACH_MIN_RPM) &&
+            (m->speed_ref < APP_MOTION_APPROACH_MIN_RPM)) {
+            m->speed_ref = (err > 0.0f) ? APP_MOTION_APPROACH_MIN_RPM
+                                        : -APP_MOTION_APPROACH_MIN_RPM;
+        }
     }
 
     return m->speed_ref;

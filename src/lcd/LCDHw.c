@@ -601,14 +601,14 @@ void Lcd_WriteData_Block(u8 *data,u32 len)
 
 #define LCD_WRITE_RETRY_MAX            (2U)
 
-void LCD_WritePixels(const u8 *data, u32 pixel_count)
+/* 内部: 把一段【紧凑排列】的像素(bpp=16)写出去。调用者负责 CS/RS。
+ * 不拉 CS —— 这样逐行写的情况(见下面的 LCD_WritePixelsEx)可以共用一次片选,
+ * 面板那边看起来就是一整条连续的 GRAM 写入。 */
+static void lcd_write_pixels_tight(const u8 *data, u32 pixel_count)
 {
 	u32 chunk_pixels;
 	u32 i;
 	u32 retry;
-
-	LCD_CS_CLR;
-	LCD_RS_SET;
 
 	while (pixel_count > 0U) {
 		chunk_pixels = pixel_count;
@@ -646,7 +646,54 @@ void LCD_WritePixels(const u8 *data, u32 pixel_count)
 		data += chunk_pixels * 2U;
 		pixel_count -= chunk_pixels;
 	}
+}
 
+void LCD_WritePixels(const u8 *data, u32 pixel_count)
+{
+	LCD_CS_CLR;
+	LCD_RS_SET;
+	lcd_write_pixels_tight(data, pixel_count);
+	LCD_CS_SET;
+}
+
+/* ============================================================================
+ * 带行间距(stride)的像素写 —— 【"数字乱码"的真正解药】
+ *
+ * 【为什么必须有这个函数】LVGL 在 PARTIAL 模式下渲染【窄区域】时, 每一行会按
+ * LV_DRAW_BUF_STRIDE_ALIGN(=64, 见 lv_conf.h) 向上对齐, 不是紧凑排列:
+ *
+ *     28px 宽的区域: 一行 28×2 = 56 字节 -> 对齐到 64 字节(每行多 8 字节填充)
+ *     48px("RPM"):  96 -> 128
+ *     95px(状态行): 190 -> 192
+ *     320px(全屏带): 640 -> 640  ← 正好对齐, 所以【全屏刷新看不出问题】
+ *
+ * 证据: lv_draw_buf.c 的 width_to_stride() 最后一步是
+ *   return LV_ROUND_UP(width_byte, LV_DRAW_BUF_STRIDE_ALIGN);
+ * 而 lv_refr.c 的 refr_area() 在 PARTIAL 模式下用 LV_STRIDE_AUTO 重建缓冲区,
+ * 最终 header->stride 就是这个值。
+ *
+ * 【不知道会怎样】原来这里按"紧凑"直接把这 1232 个像素甩给面板: 第 1 行对,
+ * 第 2 行整体右移 4 个像素, 第 3 行右移 8 个……到第 29 行已经偏了 112 个像素
+ * —— 字形被彻底撕歪成乱码。而且它是【静态】的: 写完之后没有任何东西会去修它,
+ * 所以只要数值不变, 屏上就一直是一团乱码(这也是"静止时还是乱"的原因, 它跟
+ * 面板扫描撕裂完全是两回事)。
+ *
+ * 面板的窗口是按【紧凑行】解释数据的, 所以这里逐行把 w 个像素挑出来发,
+ * 每行之间在源数据里跳过 (stride_bytes - w*2) 个填充字节。
+ * ========================================================================== */
+void LCD_WritePixelsEx(const u8 *data, u32 w, u32 h, u32 stride_bytes)
+{
+	u32 row;
+
+	if ((data == NULL) || (w == 0U) || (h == 0U) || (stride_bytes < (w * 2U))) {
+		return;
+	}
+
+	LCD_CS_CLR;
+	LCD_RS_SET;
+	for (row = 0U; row < h; row++) {
+		lcd_write_pixels_tight(data + ((size_t)row * stride_bytes), w);
+	}
 	LCD_CS_SET;
 }
 

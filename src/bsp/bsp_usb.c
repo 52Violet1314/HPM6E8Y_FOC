@@ -45,13 +45,16 @@ static bsp_usb_rx_cb_t s_rx_cb;
 void bsp_usb_init(void)
 {
     board_init_usb((USB_Type *)CONFIG_HPM_USBD_BASE);    /* 板级 USB 硬件初始化 */
-    /* USB 中断优先级 = 5。
-     * 【为什么必须是 5, 而不是原来的 2】CherryUSB 的 osal 会在中断里调用 FreeRTOS
-     * 的 API (give semaphore 等), 这类中断的优先级必须 >= configMAX_SYSCALL_INTERRUPT_PRIORITY
-     * (=4, 见 src/rtos/FreeRTOSConfig.h), 否则内核关中断期间它的数据被改坏,
-     * 表现为偶发死机。而电流环(1)/串口TX(3) 高于该阈值, 所以永不被 RTOS 屏蔽。
+    /* USB 中断优先级 = 4。
+     * 【必须是 4, 不能是 5 —— PLIC 的规则和直觉反着】HPM 的 PLIC 与 RISC-V 一致:
+     * 数值越大优先级越高, 且"优先级 > 阈值"才会被投递。FreeRTOS 临界区把阈值设成
+     * configMAX_SYSCALL_INTERRUPT_PRIORITY(=4, 见 src/rtos/FreeRTOSConfig.h)。
+     * CherryUSB 的 osal 会在中断里调 FreeRTOS API(give semaphore 等), 这类中断
+     * 【必须可屏蔽】, 即优先级要 ≤ 阈值 —— 原来写 5 反而屏蔽不掉, 内核关中断期间
+     * 它的数据会被改坏(偶发死机)。
+     * 反过来, 电流环 ADC 现在设成 7(> 阈值), 永不被 RTOS 临界区屏蔽 —— 见 bsp_adc.c。
      * 优先级表见 src/rtos/app_rtos.h。 */
-    intc_set_irq_priority(CONFIG_HPM_USBD_IRQn, 5);
+    intc_set_irq_priority(CONFIG_HPM_USBD_IRQn, 4);
     cdc_acm_init(0, CONFIG_HPM_USBD_BASE);               /* busid=0, 启动协议栈 */
 }
 

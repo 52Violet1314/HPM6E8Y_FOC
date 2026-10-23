@@ -55,6 +55,17 @@ find_package(hpm-sdk REQUIRED HINTS $ENV{HPM_SDK_BASE})
 
 project(yeezi_hpm6emotor)
 
+# ---- 【关键】让 RTOS 临界区按 PLIC 优先级屏蔽, 而不是关全局 MIE ----
+# HPM 的 PLIC: 数值越大优先级越高, 只有 "优先级 > THRESHOLD" 才被投递。
+# 不定义这个开关时, portDISABLE_INTERRUPTS() 就是 clear_csr(mstatus, MIE) —— 
+# 临界区里【所有】中断全关, 优先级形同虚设: 日志/队列/USB 一进临界区,
+# 20kHz 电流环就被挡掉(实测 1.5ms 级的间隔 -> 电机"跳一下" + 电流环自激)。
+# 定义后临界区改成 "PLIC 阈值 = configMAX_SYSCALL_INTERRUPT_PRIORITY(=4)":
+#   电流环 ADC = 7 (>4) -> 永不被临界区屏蔽;
+#   串口TX=3 / USB=4 (<=4) -> 可被屏蔽(USB 会在中断里调 RTOS API, 必须可屏蔽)。
+# 出处: HPMicro 知识库《在HPM系列芯片上实现FreeRTOS对中断优先级的管理》(sdk v1.8+)。
+sdk_compile_definitions(-DUSE_SYSCALL_INTERRUPT_PRIORITY=1)
+
 # ---- BSP ----
 sdk_inc(src/bsp)
 sdk_app_src(src/bsp/bsp_pwm.c)
@@ -83,6 +94,8 @@ sdk_app_src(src/Hardware/mt6701/mt6701.c)
 sdk_inc(src/FOC)
 sdk_app_src(src/FOC/foc.c)
 sdk_app_src(src/FOC/foc_math.c)
+# 通用 PID (电流环/速度环/位置环共用, 语义同 F405_M3508_FOC 的 PID.c)
+sdk_app_src(src/FOC/pid.c)
 sdk_app_src(src/FOC/foc_openloop.c)
 sdk_app_src(src/FOC/foc_controller.c)
 # FOC 使用 sinf/cosf/sqrtf/fmodf, 需要链接 libm
@@ -96,6 +109,8 @@ sdk_app_src(src/app/app_log.c)
 sdk_app_src(src/app/app_encoder.c)
 # 位置环 (外环): 位置误差 -> 速度给定, 内环是 app.c 里的速度环
 sdk_app_src(src/app/app_motion.c)
+# 电流环录波 (20kHz 采样 -> 触发 -> 串口 CSV 转储), 调 PI 用
+sdk_app_src(src/app/app_scope.c)
 # 离线标定的 3200 组"编码器 raw -> 电角度"查表 (tools/enc_lut_build.py 生成)
 sdk_app_src(src/app/app_enc_lut.c)
 sdk_app_src(src/app/app_nv.c)

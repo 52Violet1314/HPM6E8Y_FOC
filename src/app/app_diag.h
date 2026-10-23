@@ -352,6 +352,25 @@ int diag_csv_telemetry_lut(char *buf, uint32_t size,
                            int32_t sw_elec_mrad, int32_t enc_elec_mrad,
                            int32_t enc_raw, int32_t lut_mrad);
 
+/**
+ * @brief  电流环 CSV 遥测: 六个整数, 逗号分隔 —— 调 PI 只看这一行
+ * @param  buf        输出缓冲
+ * @param  size       缓冲大小
+ * @param  id_ref_ma  d 轴电流给定, mA
+ * @param  id_ma      d 轴电流实测, mA
+ * @param  iq_ref_ma  q 轴电流给定, mA
+ * @param  iq_ma      q 轴电流实测, mA
+ * @param  ud_mv      d 轴电压输出, mV
+ * @param  uq_mv      q 轴电压输出, mV
+ * @return 写入的字节数
+ * @note   格式 "%d,%d,%d,%d,%d,%d" (ref 与实测相邻, 相减就是误差);
+ *         细看瞬态(20kHz)请用 app_scope.c 的 "SCOPE,..." 录波
+ */
+int diag_csv_current(char *buf, uint32_t size,
+                     int32_t id_ref_ma, int32_t id_ma,
+                     int32_t iq_ref_ma, int32_t iq_ma,
+                     int32_t ud_mv, int32_t uq_mv);
+
 /* ---- 校准遥测 ---- */
 
 /** @brief 写入校准状态 */

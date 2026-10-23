@@ -168,6 +168,13 @@ void LCD_SetParam(void);
 void Lcd_WriteData_16Bit(u16 Data);
 void Lcd_WriteData_Block(u8 *data,u32 len);
 void LCD_WritePixels(const u8 *data, u32 pixel_count);
+/**
+ * @brief  写一块【带行间距】的像素 (w 列 × h 行, 每行在源数据里间隔 stride_bytes)
+ * @note   LVGL 的 PARTIAL 模式会把每行按 LV_DRAW_BUF_STRIDE_ALIGN(64B) 对齐,
+ *         窄区域(比如 28px 宽的数字位, 一行 56B -> 对齐成 64B)必须走这个函数,
+ *         否则每行错位、字形会歪成乱码。见 LCDHw.c 里的详细说明。
+ */
+void LCD_WritePixelsEx(const u8 *data, u32 w, u32 h, u32 stride_bytes);
 void LCD_direction(u8 direction );
 
 //如果仍然觉得速度不够快，可以使用下面的宏定义,提高速度.

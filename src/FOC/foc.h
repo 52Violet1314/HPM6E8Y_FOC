@@ -21,23 +21,15 @@
 
 #include "foc_config.h"
 #include "foc_math.h"
+#include "pid.h"        /* 通用 PID: 电流环/速度环/位置环共用同一个实现 */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ---- 通用 PI 控制器 ---- */
-typedef struct {
-    float kp;
-    float ki;
-    float integral;
-    float out_limit;
-    float out;
-} foc_pi_t;
-
-void  foc_pi_init(foc_pi_t *pi, float kp, float ki, float out_limit);
-void  foc_pi_reset(foc_pi_t *pi);
-float foc_pi_run(foc_pi_t *pi, float error, float ts);
+/* 电流环用的 PI 就是 pid.h 里的 PID_Controller_t (原来这里有个 foc_pi_t, 已合并:
+ * 它的"积分限幅=输出限幅、饱和即停积分"与速度环/位置环的写法不一致,
+ * 三处规则不同会让同一组 Kp/Ki 在不同环上手感不一样, 调参经验没法复用)。 */
 
 /* ---- FOC 控制器 ---- */
 typedef struct {
@@ -49,9 +41,15 @@ typedef struct {
     float id;
     float iq;
 
-    /* 电流环 PI */
-    foc_pi_t id_pi;
-    foc_pi_t iq_pi;
+    /* 相电流一阶低通的状态 (系数见 FOC_CURRENT_LPF_ALPHA)
+     * 放在结构体里而不是 ISR 局部静态: 控制器重新 init 时会随结构体一起清零。 */
+    float ia_f;
+    float ib_f;
+    float ic_f;
+
+    /* 电流环 PI (通用 PID_Controller_t) */
+    PID_Controller_t id_pi;
+    PID_Controller_t iq_pi;
 
     /* 输出 */
     float ud;

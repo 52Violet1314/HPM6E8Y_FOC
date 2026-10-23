@@ -25,7 +25,20 @@
             "toolchainPrefix": "riscv32-unknown-elf",
             "runToEntryPoint": "main",
             "preLaunchTask": "build",
-            "svdFile": ""
+            "svdFile": "",
+            // ---- Live Watch (程序全速运行时实时刷新变量, 类似 Keil 的周期刷新) ----
+            // 原理: Cortex-Debug 会额外起一个 GDB 连接("live-monitor-gdb"), 该连接
+            //       通过 RISC-V 调试模块的 System Bus Access (SBA) 直接读内存,
+            //       CPU 不停机、不打断运行, 只是借用少量总线周期。
+            //   enabled          : 打开后 OpenOCD 侧会自动追加 -c CDLiveWatchSetup
+            //                      (把 target 的 gdb-max-connections 从 1 提到 2)
+            //   samplesPerSecond : 采样率(1~20), 越大越"实时", 但占用越多调试带宽
+            // 用法: 调试启动后, 在 Run and Debug 侧边栏的 "CORTEX LIVE WATCH" 面板
+            //       点 + 添加表达式(或右键 VARIABLES 里的全局变量 → Add to Live Watch)。
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            }
         },
         {
             "name": "FT2232 OpenOCD Attach (HPM6E8Y)",
@@ -43,7 +56,12 @@
             "gdbPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-gdb.exe",
             "objdumpPath": "D:/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win/bin/riscv32-unknown-elf-objdump.exe",
             "toolchainPrefix": "riscv32-unknown-elf",
-            "svdFile": ""
+            "svdFile": "",
+            // attach 模式下同样可以 Live Watch (见上面 Debug 配置里的说明)
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            }
         },
         {
             "name": "J-Link Debug (HPM6E8Y)",

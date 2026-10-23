@@ -36,7 +36,9 @@
 /* 放在文件里的标识: core1 启动时先校验这两个值, 不匹配说明两边镜像对共享区布局的
  * 理解不一致(改结构体忘了同步编译两边/链接脚本被改过), 必须停下来, 不能装作没事。 */
 #define SHM_MAGIC           (0x4432484DUL)   /* 'M','H','2','D' */
-#define SHM_VERSION         (1U)
+/* 【v4】增加"位置滑条"命令(cmd_pos_mrad/cmd_pos_seq): 屏幕上直接拖目标位置。
+ * 结构体变了 -> 版本必须跟着变, 否则两边镜像不一致时会带着错的偏移跑。 */
+#define SHM_VERSION         (4U)
 
 /* ---------------- core1 启动阶段码 (shm->core1_stage) ----------------
  * core1 上电后没有控制台(见 core1/src/main.c), 所以它把"走到哪一步"写进共享内存,
@@ -65,6 +67,7 @@
 /* core0 状态位 (shm->status) */
 #define SHM_STATUS_RUNNING      (1UL << 0)  /* 电机闭环受控运行中 */
 #define SHM_STATUS_CALIBRATING  (1UL << 1)  /* 正在标定/静态扫描 */
+#define SHM_STATUS_MOTION       (1UL << 2)  /* 位置环已使能(屏幕上的开关状态, 由 core0 回报) */
 
 /* ---------------- 日志环 ----------------
  * 定长槽位: 每条日志一个槽位, 槽位自己带状态字(空/满)。这样生产者不需要处理
@@ -99,6 +102,22 @@ typedef struct {
     /* ---- core1 -> core0: 命令 ---- */
     volatile float    cmd_target_rpm;   /* 显示滑条设定的目标转速 */
     volatile uint32_t cmd_seq;          /* 每写一次 +1; core0 靠它判断"有新命令" */
+    /* 屏幕上的"位置环开/关"(1 = 位置模式, 0 = 速度模式)。
+     * 【为什么单独一个 seq】cmd_seq 是"值变了就重发"的语义, 而位置环使能是
+     * 【边沿事件】: app_motion_enable(true) 会把"当前位置"重新锁存成目标。
+     * 如果和滑条共用一个 seq, 那么每拖一次滑条都会重新锁存一次位置目标,
+     * 位置环就再也守不住(等于每次都被重置)。所以给它独立的序号, core0 只在
+     * 这个序号变化时才动使能位。 */
+    volatile uint32_t cmd_motion;       /* 0/1: 显示核要的位置环使能 */
+    volatile uint32_t cmd_motion_seq;   /* 每写一次 +1 */
+
+    /* 【位置滑条】屏幕上的位置目标 (mrad, 0..6283 = 0..360° 机械角)。
+     * 【为什么又单独一个 seq】拖手指时这个值会连着变很多次。如果和 cmd_motion
+     * 共用一个序号, 那每拖一次滑条都会被 core0 当成"使能边沿"处理一次 ——
+     * 而使能边沿会把当前位置重新锁存成目标(见上面), 于是位置环每拖一下就重置,
+     * 根本守不住。所以三个命令各用各的序号。 */
+    volatile int32_t  cmd_pos_mrad;     /* 0..6283 mrad */
+    volatile uint32_t cmd_pos_seq;      /* 每写一次 +1 */
 
     /* ---- core1 存活/诊断 ---- */
     volatile uint32_t core1_alive;      /* core1 显示任务每拍 +1 (200Hz) */
@@ -111,6 +130,16 @@ typedef struct {
     volatile uint32_t log_tail;         /* 只有 core0 写 */
     volatile uint32_t log_dropped;      /* core1 因环满丢弃的行数 */
     shm_log_slot_t    log[SHM_LOG_SLOTS];
+
+    /* ---- 反向日志环 (core0 生产, core1 消费) ----------------
+     * 【为什么需要】core0 自己的两个输出口都指望不上: USB CDC 一断电就没了,
+     * UART0 接的是板上调试口(不一定接出来)。而 core1 现在有一条独立的 UART14。
+     * 于是 core0 的日志经这个环交给 core1 转发出去 —— 两个核的日志最终都出现在
+     * 同一个串口上, core0 那边一根线都不用接。 */
+    volatile uint32_t log0_head;        /* 只有 core0 写 */
+    volatile uint32_t log0_tail;        /* 只有 core1 写 */
+    volatile uint32_t log0_dropped;     /* core0 因环满丢弃的行数 */
+    shm_log_slot_t    log0[SHM_LOG_SLOTS];
 } shm_t;
 
 /* 链接脚本符号: 两个镜像里都存在, 都指向 SHARE_RAM 的起点(0x012FC000) */
@@ -126,22 +155,25 @@ static inline shm_t *shm_get(void)
  * 而不是运行起来把隔壁的 AXI_SRAM 踩了。 */
 typedef char shm_size_must_fit_in_share_ram[(sizeof(shm_t) <= (16U * 1024U)) ? 1 : -1];
 
-/* ---------------- 日志环: 单生产者入队 (core1) ----------------
- * @return 1=已入队, 0=环满(丢弃) */
-static inline int shm_log_push(shm_t *s, const char *line)
+/* ---------------- 环形槽位的通用实现 (两个方向各用一套) ----------------
+ * 单生产者/单消费者: 两个指针各自只有一个核写, 32 位对齐访问在 RV32 上是原子的。 */
+static inline int shm_ring_push(volatile uint32_t *head_p, volatile uint32_t *dropped_p,
+                                shm_log_slot_t *slots, const char *line)
 {
     uint32_t head;
     shm_log_slot_t *slot;
 
-    if ((s == NULL) || (line == NULL)) {
+    if ((head_p == NULL) || (slots == NULL) || (line == NULL)) {
         return 0;
     }
-    head = __atomic_load_n(&s->log_head, __ATOMIC_RELAXED);
-    slot = &s->log[head % SHM_LOG_SLOTS];
+    head = __atomic_load_n(head_p, __ATOMIC_RELAXED);
+    slot = &slots[head % SHM_LOG_SLOTS];
 
     if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != 0U) {
-        /* 消费者还没腾出这个槽位: 丢, 并记账。绝不等待 —— 刷屏比日志重要。 */
-        (void)__atomic_add_fetch(&s->log_dropped, 1U, __ATOMIC_RELAXED);
+        /* 消费者还没腾出这个槽位: 丢, 并记账。绝不等待。 */
+        if (dropped_p != NULL) {
+            (void)__atomic_add_fetch(dropped_p, 1U, __ATOMIC_RELAXED);
+        }
         return 0;
     }
 
@@ -155,22 +187,21 @@ static inline int shm_log_push(shm_t *s, const char *line)
     }
 
     __atomic_store_n(&slot->state, 1U, __ATOMIC_RELEASE);
-    __atomic_store_n(&s->log_head, head + 1U, __ATOMIC_RELEASE);
+    __atomic_store_n(head_p, head + 1U, __ATOMIC_RELEASE);
     return 1;
 }
 
-/* ---------------- 日志环: 单消费者出队 (core0) ----------------
- * @return 1=取到一行(已写进 out), 0=环空 */
-static inline int shm_log_pop(shm_t *s, char *out, uint32_t out_sz)
+static inline int shm_ring_pop(volatile uint32_t *tail_p, shm_log_slot_t *slots,
+                               char *out, uint32_t out_sz)
 {
     uint32_t tail;
     shm_log_slot_t *slot;
 
-    if ((s == NULL) || (out == NULL) || (out_sz == 0U)) {
+    if ((tail_p == NULL) || (slots == NULL) || (out == NULL) || (out_sz == 0U)) {
         return 0;
     }
-    tail = __atomic_load_n(&s->log_tail, __ATOMIC_RELAXED);
-    slot = &s->log[tail % SHM_LOG_SLOTS];
+    tail = __atomic_load_n(tail_p, __ATOMIC_RELAXED);
+    slot = &slots[tail % SHM_LOG_SLOTS];
 
     if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) == 0U) {
         return 0;
@@ -186,8 +217,46 @@ static inline int shm_log_pop(shm_t *s, char *out, uint32_t out_sz)
     }
 
     __atomic_store_n(&slot->state, 0U, __ATOMIC_RELEASE);
-    __atomic_store_n(&s->log_tail, tail + 1U, __ATOMIC_RELEASE);
+    __atomic_store_n(tail_p, tail + 1U, __ATOMIC_RELEASE);
     return 1;
+}
+
+/* ---------------- 日志环: 单生产者入队 (core1) ----------------
+ * @return 1=已入队, 0=环满(丢弃) */
+static inline int shm_log_push(shm_t *s, const char *line)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    return shm_ring_push(&s->log_head, &s->log_dropped, s->log, line);
+}
+
+/* ---------------- 日志环: 单消费者出队 (core0) ----------------
+ * @return 1=取到一行(已写进 out), 0=环空 */
+static inline int shm_log_pop(shm_t *s, char *out, uint32_t out_sz)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    return shm_ring_pop(&s->log_tail, s->log, out, out_sz);
+}
+
+/* ---------------- 反向环: core0 生产 (日志) ---------------- */
+static inline int shm_log0_push(shm_t *s, const char *line)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    return shm_ring_push(&s->log0_head, &s->log0_dropped, s->log0, line);
+}
+
+/* ---------------- 反向环: core1 消费 (转发到 UART14) ---------------- */
+static inline int shm_log0_pop(shm_t *s, char *out, uint32_t out_sz)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    return shm_ring_pop(&s->log0_tail, s->log0, out, out_sz);
 }
 
 /* SD 卡式的"距离"运算: 两个单调递增的序号不相等就说明有变化(不比较大小,

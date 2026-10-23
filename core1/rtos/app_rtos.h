@@ -19,9 +19,12 @@
  * 反过来 core1 使能的 LCD DMA 中断也不会打扰 core0 的 1kHz 控制任务 ——
  * 这正是把显示搬到 core1 的收益: 刷屏再慢也抢不到控制核的中断与总线优先级。
  *
- * LCD 像素 DMA 完成 = 6: 它在中断里 give 一个信号量, 所以必须 >=
- * configMAX_SYSCALL_INTERRUPT_PRIORITY(4)。 */
-#define APP_IRQ_PRIO_LCD_DMA    (6U)
+ * 【优先级 4, 不是 6】HPM 的 PLIC 数值越大优先级越高, 且只有 "优先级 > 阈值"
+ * 才被投递; RTOS 临界区把阈值设成 configMAX_SYSCALL_INTERRUPT_PRIORITY(=4)。
+ * LCD 像素 DMA 的中断里会 xSemaphoreGiveFromISR(用了 RTOS API), 按规范
+ * 【必须可屏蔽】= 优先级 ≤ 4 —— 原来写 6 反而屏蔽不掉, 临界区里进来会改坏
+ * 内核数据。core0 那边同一个道理: 电流环 ADC=7(>4, 不可屏蔽), USB=4(可屏蔽)。 */
+#define APP_IRQ_PRIO_LCD_DMA    (4U)
 
 /* ---------------- 任务优先级 (数值越大越高) ---------------- */
 #define APP_TASK_PRIO_DISPLAY   (configMAX_PRIORITIES - 2)

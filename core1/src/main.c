@@ -20,12 +20,16 @@
  *       board_init_pmp()          : PMP/PMA 是每核独立的寄存器(见 SDK 的 multicore
  *                                  文档), SHARE_RAM 必须在本核也被配成"非缓存",
  *                                  否则从共享内存读到的是本核 cache 里的旧值。
- *   - 也不要调 board_init_console(): 控制台 UART 是 core0 的。core1 的日志全部
- *     写进共享内存的槽位环, 由 core0 的日志任务统一输出(见 app_log_ring.c)。
+ *   - 也不要调 board_init_console(): 那是 core0 的控制台(UART0/PA00,PA01)。
+ *     【core1 现在有自己的控制台了】UART14 = PF24(TXD)/PF25(RXD) = J11 的 40/37 脚,
+ *     见 console_uart14.c: core1 的日志直接走这条线, 不再依赖 core0 的日志任务。
+ *     (原来那套"全部写进共享内存环、由 core0 转发"的路仍然保留着, 作为
+ *      上电最早期和没接适配器时的退路。)
  */
 #include "board.h"
 
 #include "app_log.h"
+#include "console_uart14.h"     /* core1 独立控制台: UART14 = PF24/PF25 = J11 40/37 */
 #include "core1_boot_info.h"    /* CORE1_IMG_BASE / CORE1_IMG_ENTRY: 本镜像的落点 */
 #include "lcd_app.h"
 #include "shm_client.h"
@@ -37,6 +41,11 @@ int main(void)
     /* ---- 1) 补齐"每核独立"的初始化 (理由见文件头) ---- */
     clock_update_core_clock();
     board_init_pmp();
+
+    /* 【必须放在第一行日志之前】把 core1 的日志从"共享内存 -> core0 的日志任务"
+     * 改到自己的 UART14 上。之后 core0 的控制环再忙, 这边的日志照样出得来。
+     * 初始化失败也不影响启动: ready() 返回 0, 日志自动退回共享环。 */
+    core1_console_uart_init();
 
     shm_client_stage(CORE1_STAGE_ENTER);
 

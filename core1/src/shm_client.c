@@ -104,3 +104,45 @@ uint8_t shm_client_target_apply_pending(void)
     }
     return pending;
 }
+
+/* 屏幕开关 -> core0 的位置环使能。边沿事件, 用独立序号。 */
+static volatile uint8_t s_motion_req;
+
+void shm_client_set_motion(uint8_t on)
+{
+    shm_t *shm = shm_get();
+    uint32_t seq;
+    uint8_t  v = (on != 0U) ? 1U : 0U;
+
+    if (v == s_motion_req) {
+        return;                 /* 值没变: 不占序号, 免得 core0 反复重新锁存目标 */
+    }
+    s_motion_req = v;
+
+    seq = __atomic_load_n(&shm->cmd_motion_seq, __ATOMIC_RELAXED);
+    shm->cmd_motion = v;        /* 先写数据 */
+    __atomic_store_n(&shm->cmd_motion_seq, seq + 1U, __ATOMIC_RELEASE);   /* 再写序号 */
+}
+
+/* 屏幕上的位置滑条: 目标位置 (mrad)。语义和 set_motion 一样 ——
+ * 值没变就不占序号(拖动时同一像素来回蹭不该反复下发), 变了才发。 */
+void shm_client_set_pos_mrad(int32_t mrad)
+{
+    shm_t   *shm = shm_get();
+    uint32_t seq;
+    static int32_t s_pos_req;
+
+    if (mrad == s_pos_req) {
+        return;                 /* 值没变: 不占序号 */
+    }
+    s_pos_req = mrad;
+
+    seq = __atomic_load_n(&shm->cmd_pos_seq, __ATOMIC_RELAXED);
+    shm->cmd_pos_mrad = mrad;   /* 先写数据 */
+    __atomic_store_n(&shm->cmd_pos_seq, seq + 1U, __ATOMIC_RELEASE);      /* 再写序号 */
+}
+
+uint8_t shm_client_motion_requested(void)
+{
+    return s_motion_req;
+}

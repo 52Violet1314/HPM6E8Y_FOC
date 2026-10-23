@@ -29,6 +29,8 @@ extern const uint32_t sec_core_img_size;
 
 /* ---- 运行时状态 ---- */
 static uint32_t s_last_cmd_seq;         /* 最近一次处理过的显示核命令序号 */
+static uint32_t s_last_motion_seq;      /* 同上, 位置环开关命令(边沿事件) */
+static uint32_t s_last_pos_seq;         /* 同上, 位置滑条命令(值变了就锁存) */
 static uint32_t s_last_alive;           /* 最近一次看到的 core1 心跳值 */
 static uint32_t s_last_stage;           /* 最近一次看到的 core1 启动阶段 */
 static uint32_t s_last_health_tick;     /* 心跳检查节流 (1s) */
@@ -135,6 +137,39 @@ void core1_sync(void)
         app_speed_target_set(shm->cmd_target_rpm);
     }
 
+    /* ---- 1c) 下行: 屏幕位置滑条的目标位置 (mrad) ----
+     * 【和上面两个的区别】它是"值变了就锁存"的语义(拖动时连续变), 不是边沿事件 ——
+     * 所以拖到哪就守到哪, 不会像使能边沿那样把当前位置重置成目标。
+     * app_motion_set_target_rad() 内部只写 pos_ref, 不动使能, 随便连续调都安全。 */
+    {
+        uint32_t pseq = __atomic_load_n(&shm->cmd_pos_seq, __ATOMIC_ACQUIRE);
+
+        if (shm_seq_changed(pseq, s_last_pos_seq) != 0) {
+            int32_t mrad = shm->cmd_pos_mrad;
+
+            s_last_pos_seq = pseq;
+            app_motion_set_target_rad((float)mrad * 0.001f);
+            /* 显示用: mrad -> 度 (1 deg = 17.4533 mrad), 用整数算免得引入浮点打印 */
+            LOG_I("MOT", "屏幕滑条: 目标位置 %d mrad (%d.%02d deg)",
+                  (int)mrad, (int)(mrad / 17), (int)(((mrad % 17) * 100) / 17));
+        }
+    }
+
+    /* ---- 1b) 下行: 屏幕上的"位置环开/关" ----
+     * 【必须用独立序号】app_motion_set_enable(1) 会把"当前位置"重新锁存成目标
+     * (见 app_motion_enable 的说明), 所以它只能在【边沿】上执行一次 —— 要是和
+     * 滑条共用一个序号, 每拖一次滑条就会把位置目标重置一次, 位置环永远守不住。 */
+    {
+        uint32_t mseq = __atomic_load_n(&shm->cmd_motion_seq, __ATOMIC_ACQUIRE);
+
+        if (shm_seq_changed(mseq, s_last_motion_seq) != 0) {
+            s_last_motion_seq = mseq;
+            app_motion_set_enable((shm->cmd_motion != 0U) ? 1U : 0U);
+            LOG_I("MOT", "屏幕开关: 位置环 %s (速度模式/位置模式已切换)",
+                  (shm->cmd_motion != 0U) ? "ON (位置模式)" : "OFF (速度模式)");
+        }
+    }
+
     /* ---- 2) 上行: 遥测快照 ----
      * 先写数据, 最后写序号(release): core1 看到序号变了, 就一定看得到这些数据。 */
     if (app_speed_is_running() != 0U) {
@@ -142,6 +177,11 @@ void core1_sync(void)
     }
     if (app_speed_is_calibrating() != 0U) {
         status |= SHM_STATUS_CALIBRATING;
+    }
+    /* 把位置环的【实际】使能状态回报给屏幕: 界面据此把开关画成真实状态,
+     * 而不是"我按了什么就显示什么"(使能可能因为未运行/故障没生效)。 */
+    if (app_motion_is_enabled() != 0U) {
+        status |= SHM_STATUS_MOTION;
     }
     shm->rpm = app_speed_get_rpm();
     shm->target = app_speed_get_target();

@@ -27,6 +27,7 @@
 #include "lcd_app.h"
 #include "lcd_ui.h"
 #include "touch_calibration.h"
+#include "console_uart14.h"     /* core1 独立控制台(UART14)的 DMA 续传 */
 #include "lvgl.h"
 #include "app_log.h"        /* 汇总统计走日志队列(不阻塞刷屏) */
 
@@ -123,6 +124,14 @@ static void lcd_flush_cb(lv_display_t *display, const lv_area_t *area,
     uint32_t width = (uint32_t)(area->x2 - area->x1 + 1);
     uint32_t height = (uint32_t)(area->y2 - area->y1 + 1);
     uint32_t pixels = width * height;
+    /* 【必须按 LVGL 实际用的 stride 取数据 —— 这是"数字乱码"的根因】
+     * PARTIAL 模式下 LVGL 会把每行按 LV_DRAW_BUF_STRIDE_ALIGN(=64B) 向上对齐:
+     *   28px 宽 -> 一行 56B, 但实际占 64B(每行 8B 填充)
+     *   320px 宽 -> 640B, 正好对齐, 所以【全屏刷新看不出问题】
+     * 以前这里无视 stride、按紧凑数据直接发, 于是第 2 行右移 4px、第 3 行右移
+     * 8px…… 29 行累计偏 112px, 字形被撕成乱码, 而且写完没人修 -> 静止时也是乱的。
+     * 详见 LCDHw.c 的 LCD_WritePixelsEx()。 */
+    uint32_t stride = lv_draw_buf_width_to_stride(width, LV_COLOR_FORMAT_RGB565);
 
     s_flush_count++;
     s_flush_pixels += pixels;
@@ -134,10 +143,12 @@ static void lcd_flush_cb(lv_display_t *display, const lv_area_t *area,
     /* 只打前几次: 确认 LVGL 给的 area 与 LCD_SetWindows 的入参一致(实验 3)。
      * 走日志队列 -> 由日志任务写串口, 显示任务不会被串口拖住。 */
     if (s_flush_count <= LCD_APP_TRACE_FLUSH_COUNT) {
-        LOG_I("LCD", "flush#%u area=(%d,%d)-(%d,%d) %ux%u pix=%u",
+        LOG_I("LCD", "flush#%u area=(%d,%d)-(%d,%d) %ux%u pix=%u stride=%u%s",
               (unsigned)s_flush_count, (int)area->x1, (int)area->y1,
               (int)area->x2, (int)area->y2,
-              (unsigned)width, (unsigned)height, (unsigned)pixels);
+              (unsigned)width, (unsigned)height, (unsigned)pixels,
+              (unsigned)stride,
+              (stride == (width * 2U)) ? "" : " (有填充!)");
     }
 #endif
 
@@ -147,7 +158,11 @@ static void lcd_flush_cb(lv_display_t *display, const lv_area_t *area,
 
     LCD_SetWindows((u16)area->x1, (u16)area->y1,
                    (u16)area->x2, (u16)area->y2);
-    LCD_WritePixels(pixel_map, pixels);
+    if (stride == (width * 2U)) {
+        LCD_WritePixels(pixel_map, pixels);                 /* 紧凑: 照旧 */
+    } else {
+        LCD_WritePixelsEx(pixel_map, width, height, stride); /* 有行填充: 逐行挑 */
+    }
 
 #if LCD_APP_TEST_CRITICAL_FLUSH
     taskEXIT_CRITICAL();
@@ -291,6 +306,17 @@ void lcd_app_task_handler(void)
 
         lcd_app_lvgl_unlock();
     }
+
+    /* ---- core1 独立控制台(UART14)的 DMA 续传 ----
+     * 串口发送用 HDMA(通道 1), 但【刻意屏蔽了它的中断】: IRQn_HDMA 是和 LCD 像素
+     * DMA(通道 0)共用的一条线, 而且 lcd_hw_dma_isr 只清通道 0 的标志 —— 这里要是
+     * 打开中断, 中断线会一直挂着, 显示直接完蛋。所以完成状态由本任务每拍读走,
+     * 顺便续传环里剩下的数据(行尾最多晚 5ms, 日志无所谓)。
+     * FIFO 中断模式下这个调用是空操作。见 core1/src/console_uart14.c。 */
+    core1_console_uart_poll();
+    /* core0 的日志(共享内存反向环)也从这条线出去 —— 于是两个核的日志在同一个串口上,
+     * core0 那边一根线都不用接。见 core1/src/console_uart14.c。 */
+    core1_console_forward_core0();
 
     /* ---- 每 5 秒汇总一行"像素通路"统计(判断到底有没有丢数据) ----
      * 本任务周期 5ms(见 core1/rtos/app_rtos.c) -> 1000 拍 = 5s。

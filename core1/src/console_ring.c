@@ -26,6 +26,7 @@
 #include "board.h"
 #include "app_log.h"        /* bsp_console_write 的声明: 与 SDK 的弱定义同一签名 */
 #include "shm_core.h"
+#include "console_uart14.h" /* core1 独立控制台(UART14) */
 
 #define CORE1_CONSOLE_LINE_MAX  (SHM_LOG_LINE_LEN)
 
@@ -51,6 +52,14 @@ int bsp_console_write(const char *data, int size)
         return 0;
     }
 
+#if CORE1_CONSOLE_OWN_UART
+    /* UART14 就绪就直接从自己的串口出去(printf / LVGL 日志 / SDK 断言都走这里)。
+     * 这条路径和 core0 完全无关, 所以 core0 的控制环再忙, 日志也不会消失。 */
+    if (core1_console_uart_ready() != 0) {
+        return core1_console_uart_write(data, size);
+    }
+#endif
+    /* 还没初始化(上电最早期)或没接适配器: 退回共享内存环, 由 core0 转发 */
     for (i = 0; i < size; i++) {
         char c = data[i];
 

@@ -9,12 +9,14 @@
  *   - 日志任务负责格式化+写串口/USB, 显示任务负责 LVGL 刷屏。
  *
  * 【最要紧的一条: 电流环 ISR 不能被内核挡住】
- *   电流环跑在 ADC 完成中断里(PLIC 优先级 1)。FreeRTOS 的临界区会关中断, 如果
- *   电流环落在这个范围内, 20kHz 环路就会被拖长 —— 那正是之前"高速时顿挫"的
- *   根源。所以这里把 configMAX_SYSCALL_INTERRUPT_PRIORITY 设成 4:
- *       优先级 1/2/3 的中断(电流环=1, 串口TX=3) 永远不被屏蔽;
- *       优先级 >=4 的中断(USB=5) 会被屏蔽 —— 但只有它会调用 RTOS API, 必须如此。
- *   【改动中断优先级时务必对照这张表, 见 app_rtos.h 的说明。】
+ *   电流环跑在 ADC 完成中断里。FreeRTOS 的临界区会把 PLIC 阈值抬到
+ *   configMAX_SYSCALL_INTERRUPT_PRIORITY, 而 PLIC 的规则是【优先级数值越大越高、
+ *   且只有 优先级 > 阈值 才被投递】。所以:
+ *       阈值 = 4  ->  优先级 ≤4 的中断在临界区里【被屏蔽】, 5~7 不受影响。
+ *   电流环因此必须放在 7(最高): 它绝不能被内核挡住。
+ *   会调用 RTOS API 的中断(USB/CherryUSB) 必须放在 ≤4, 好让临界区把它屏蔽住。
+ *   【原来这里写的是"1/2/3 永不屏蔽", 与 PLIC 语义正好相反, 已修正;
+ *     对照表见 app_rtos.h。】
  */
 #ifndef FREERTOS_CONFIG_H
 #define FREERTOS_CONFIG_H
@@ -73,9 +75,10 @@
 #define configTIMER_QUEUE_LENGTH                8
 #define configTIMER_TASK_STACK_DEPTH            (configMINIMAL_STACK_SIZE)
 
-/* 高于(数值小于)这个优先级的中断不受内核临界区影响。
- * 1=电流环ADC  3=串口TX  → 永不屏蔽, 实时性不受 RTOS 影响
- * 5=USB(会在中断里调 RTOS API) → 必须 >= 本值 */
+/* PLIC 阈值: 临界区里只有 "优先级 > 本值" 的中断还会被投递
+ *   (PLIC 语义: 数值越大优先级越高, 见 app_rtos.h 的表)
+ *   7=电流环ADC      -> >4, 永不被临界区屏蔽
+ *   3=串口TX / 4=USB -> ≤4, 可被屏蔽(USB 要在中断里调 RTOS API, 必须可屏蔽) */
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY    4
 
 /* 断言: 出错就断点+死循环, 便于调试器直接抓到出错现场 */

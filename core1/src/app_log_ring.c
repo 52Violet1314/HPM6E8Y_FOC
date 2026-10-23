@@ -21,15 +21,39 @@
 
 #include "shm_core.h"
 #include "app_log.h"
+#include "console_uart14.h"     /* core1 独立控制台(UART14): 不再吊在 core0 的日志任务上 */
 
 #define APP_LOG_LINE_LEN    (256)
 
-/* 入队实现 (三个对外入口共用) */
+/* 【core1 的日志走哪条路】
+ *   1) UART14(自己的串口) —— 只要接上 USB-TTL 就能看到, 和 core0 死活无关;
+ *   2) 共享内存正向环(log) —— core0 的日志任务搬出去转发。
+ *
+ * 【2026-10-24: 两者不再同时用】因为 core0 的日志现在会经"反向环(log0)"交给 core1
+ * 从 UART14 输出 —— 如果 core1 还同时往正向环里推, 那条路会绕一圈又回到 core1,
+ * 同一条日志在串口上出现两遍。所以改成二选一:
+ *   UART14 就绪 -> 只走 1;  否则(极早期/初始化失败) -> 退回 2, 由 core0 转发。
+ *
+ * 把 CORE1_LOG_KEEP_SHM_RING 改成 1 = "永远两条都发"(会重复, 只在排查转发链路时用)。 */
+#ifndef CORE1_LOG_KEEP_SHM_RING
+#define CORE1_LOG_KEEP_SHM_RING (0)
+#endif
+
 static void core1_log_emit(const char *line)
 {
     if (line == NULL) {
         return;
     }
+#if CORE1_CONSOLE_OWN_UART
+    if (core1_console_uart_ready() != 0) {
+        core1_console_uart_write_line(line);
+#if CORE1_LOG_KEEP_SHM_RING
+        (void)shm_log_push(shm_get(), line);
+#endif
+        return;                     /* 已经写出去了, 不再绕 core0 */
+    }
+#endif
+    /* UART14 还没就绪: 退回共享环, 由 core0 的日志任务转发(绝不静默丢日志) */
     (void)shm_log_push(shm_get(), line);
 }
 

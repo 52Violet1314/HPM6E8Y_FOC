@@ -195,6 +195,20 @@ int diag_csv_telemetry_lut(char *buf, uint32_t size,
                     (int)enc_raw, (int)lut_mrad);
 }
 
+int diag_csv_current(char *buf, uint32_t size,
+                     int32_t id_ref_ma, int32_t id_ma,
+                     int32_t iq_ref_ma, int32_t iq_ma,
+                     int32_t ud_mv, int32_t uq_mv)
+{
+    /* 调电流环只看这 6 个数: ref 与实测相邻排列, 相减就是电流环误差。
+     * 【不带 "\r\n"】两个日志后端 (console 的 printf("%s\r\n") 与 USB 的
+     * write + write("\r\n")) 都已经补了 CRLF。 */
+    return snprintf(buf, size, "%d,%d,%d,%d,%d,%d",
+                    (int)id_ref_ma, (int)id_ma,
+                    (int)iq_ref_ma, (int)iq_ma,
+                    (int)ud_mv, (int)uq_mv);
+}
+
 int diag_cal_telemetry(char *buf, uint32_t size)
 {
     /* 只留校准必需的 4 个数, 尽量短; 单位统一是 mrad (0..6283 = 0..360°) */

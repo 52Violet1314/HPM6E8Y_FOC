@@ -56,6 +56,23 @@ const core1_telem_t *shm_client_telem(void);
 void shm_client_set_target(float rpm);
 
 /**
+ * @brief  把屏幕上的"位置环开/关"发给 core0 (开关回调里调, 无锁, 立即返回)
+ * @param  on  1 = 位置模式(位置环使能), 0 = 速度模式(滑条直接给目标转速)
+ * @note   用独立的序号(cmd_motion_seq): 使能是边沿事件, 重复下发会让位置环
+ *         每次都把当前位置重新锁存成目标。on 与当前值相同时直接返回, 不占序号。
+ */
+void shm_client_set_motion(uint8_t on);
+
+/** 位置滑条: 把目标位置(mrad, 0..6283)发给 core0; 值没变则不发 */
+void shm_client_set_pos_mrad(int32_t mrad);
+
+/**
+ * @brief  上一次 set_motion() 传下去的值 (只反映"我发过什么", 不是 core0 的实际状态)
+ * @note   要看实际状态请用 status 里的 SHM_STATUS_MOTION 位。
+ */
+uint8_t shm_client_motion_requested(void);
+
+/**
  * @brief  "目标转速刚被 core0 下发到控制环" ? (读走即清, 语义同 core0 的
  *         app_speed_target_pending())
  */

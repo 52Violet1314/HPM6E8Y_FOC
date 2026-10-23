@@ -54,6 +54,13 @@ find_package(hpm-sdk REQUIRED HINTS $ENV{HPM_SDK_BASE})
 
 project(yeezi_core1)
 
+# ---- 和 core0 一致: 让临界区按 PLIC 优先级屏蔽而不是关全局 MIE ----
+# core1 的实时中断是 LCD 像素 DMA(优先级 4, <=阈值) -> 临界区里可屏蔽;
+# 它会在中断里调 xSemaphoreGiveFromISR, 按规范【必须】可屏蔽, 所以优先级
+# 从 6 降到 4(见 core1/rtos/app_rtos.h)。两核用同一个 port, 开关必须一致,
+# 否则同一个 elf 里两套 port.c 实现会不一致。
+sdk_compile_definitions(-DUSE_SYSCALL_INTERRUPT_PRIORITY=1)
+
 # ---- 头文件路径 ----
 sdk_inc(rtos)                 # core1 自己的 FreeRTOSConfig.h / app_rtos.h
 sdk_inc(src)
@@ -68,6 +75,11 @@ sdk_app_src(src/shm_client.c)
 sdk_app_src(src/app_telem_client.c)
 sdk_app_src(src/app_log_ring.c)
 sdk_app_src(src/console_ring.c)     # 覆盖 SDK 的弱 bsp_console_write: printf 也走日志环
+# core1 自己的控制台: UART14 = PF24(TXD)/PF25(RXD) = J11 40/37
+# 【为什么需要它】原来 core1 的日志全靠 core0 的日志任务转发, 而 core0 的控制环
+# 一旦跑满 CPU(实测 979Hz > 1kHz 周期)就不再让出, 低优先级的日志任务永远轮不到
+# —— 两个核的日志会一起消失。这条 UART 让 core1 彻底独立。
+sdk_app_src(src/console_uart14.c)
 sdk_app_src(rtos/app_rtos.c)
 
 # ---- 显示/触摸/LVGL 桥 ----
@@ -79,6 +91,8 @@ sdk_app_src(../src/lcd/LCDTouch.c)
 sdk_app_src(../src/lcd/LCDGui.c)
 sdk_app_src(../src/lcd/lcd_app.c)
 sdk_app_src(../src/lcd/lcd_ui.c)
+# 大字转速用的等宽数字字体(由 tools/_mk_digitfont.py 生成, 位图借自 montserrat_40)
+sdk_app_src(../src/lcd/lv_font_digits_40.c)
 
 # LVGL 的绘制/字体代码用到 libm
 sdk_link_libraries(m)

@@ -4,5 +4,8 @@
     // 直接使用 CMake 生成的 compile_commands.json 作为 IntelliSense 数据源
     "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
     "C_Cpp.default.cStandard": "c11",
-    "C_Cpp.default.cppStandard": "c++17"
+    "C_Cpp.default.cppStandard": "c++17",
+    // Cortex Live Watch 面板的界面刷新周期(ms), 与 launch.json 里的 samplesPerSecond 相互独立
+    // 低于 250ms 反而看不清, 低于 200ms 基本不工作; 建议 300~500
+    "cortex-debug.liveWatchRefreshRate": 300
 }

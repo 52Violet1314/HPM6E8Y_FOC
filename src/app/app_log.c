@@ -31,9 +31,13 @@
 #define APP_LOG_MAX_BACKENDS   (4)
 #define APP_LOG_LINE_LEN       (256)
 #define APP_LOG_QUEUE_LEN      (16)     /* 16 行 x 256B = 4KB: 够扛住一次突发 */
+/* 延迟格式化记录的队列深度: 热路径每秒最多几条, 8 足够 */
+#define APP_LOG_REC_QUEUE_LEN  (8)
 
 static app_log_backend_fn s_backends[APP_LOG_MAX_BACKENDS];
 static QueueHandle_t      s_log_q;
+static QueueHandle_t      s_rec_q;      /* app_log_rec_t 队列(控制任务 -> 日志任务) */
+static app_log_fmt_fn_t   s_fmt;        /* 延迟记录的格式化回调 */
 
 int app_log_add_backend(app_log_backend_fn fn)
 {
@@ -74,6 +78,45 @@ static void app_log_dispatch(const char *line)
         return;
     }
     (void)xQueueSend(s_log_q, line, 0);     /* 满则丢弃, 绝不阻塞 */
+}
+
+/* ================= 延迟格式化日志 (控制任务热路径) =================
+ * 见 app_log.h 顶部的说明: 把 vsnprintf 从控制任务挪到日志任务。 */
+
+void app_log_set_formatter(app_log_fmt_fn_t fn)
+{
+    s_fmt = fn;
+}
+
+/* 没有队列/调度器还没起来: 退化成"当场格式化", 宁可慢一点也不能丢日志 */
+static void app_log_post_now(const app_log_rec_t *rec)
+{
+    char line[APP_LOG_LINE_LEN];
+
+    if (s_fmt == NULL) {
+        return;
+    }
+    s_fmt(rec, line, sizeof(line));
+    app_log_call_backends(line);
+}
+
+int app_log_post(const app_log_rec_t *rec)
+{
+    if ((rec == NULL) || (s_fmt == NULL)) {
+        return 0;
+    }
+
+    if (s_rec_q == NULL) {
+        s_rec_q = xQueueCreate(APP_LOG_REC_QUEUE_LEN, sizeof(app_log_rec_t));
+    }
+    if ((s_rec_q == NULL) || (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED)) {
+        app_log_post_now(rec);
+        return 0;
+    }
+
+    /* 【这里就是全部开销】一次定长结构体拷贝 + 入队, 没有 snprintf。
+     * 拿不到锁/队列满都直接丢 —— 日志永远不该让控制任务等。 */
+    return (xQueueSend(s_rec_q, rec, 0) == pdTRUE) ? 1 : 0;
 }
 
 void app_log_write(app_log_level_t level, const char *tag, const char *fmt, ...)
@@ -142,12 +185,19 @@ void app_log_write_direct(const char *line)
 void app_log_task_body(void)
 {
     static char line[APP_LOG_LINE_LEN];
+    app_log_rec_t rec;
 
     for (;;) {
         if ((s_log_q != NULL) &&
             (xQueueReceive(s_log_q, line, pdMS_TO_TICKS(10)) == pdTRUE)) {
             app_log_call_backends(line);
         }
+
+        /* ---- 延迟格式化的记录: 【snprintf 在这里跑, 不在控制任务里】 ---- */
+        while ((s_rec_q != NULL) && (xQueueReceive(s_rec_q, &rec, 0) == pdTRUE)) {
+            app_log_post_now(&rec);
+        }
+
         /* core1 的日志 + 它的心跳检查(内部 1s 节流) */
         core1_log_drain();
         core1_health_check();
