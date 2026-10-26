@@ -175,6 +175,15 @@ extern "C" {
 #define APP_LOG_FOC_LINE            (APP_DEBUG_ALL)
 #endif
 
+/* 速度环 ADRC 状态行 (每秒一行): ref / rpm / z1 / err / z2 / iq。
+ * 调 ADRC 时看它:
+ *   z1 ≈ rpm       -> 观测器跟得上 (跟不上: 提高 WO_HZ)
+ *   z2 大幅摆动    -> 观测器在追噪声 (降低 WO_HZ, 或加大速度低通)
+ *   |err| 不收敛   -> WC_HZ 太小 / b0 偏差太大 (看下面 B0_SCALE 的实测方法) */
+#ifndef APP_LOG_ADRC_STATUS
+#define APP_LOG_ADRC_STATUS         (APP_DEBUG_ALL)
+#endif
+
 /* [ENC] 编码器体检行 (185 字符, 每 APP_ENC_HEALTH_MS 一次)。
  * 只在查编码器接线/丢帧时需要。 */
 #ifndef APP_LOG_ENC_HEALTH
@@ -418,6 +427,98 @@ extern "C" {
  *   1.5A / 0.02  = ±75 RPM   <- 覆盖实际摆动幅度, 环路才回到线性区
  * 结论: 限幅和 Kp 必须一起看, 只压限幅会把环路逼成开关控制。 */
 #define APP_FOC_SPEED_IQ_LIMIT_A    (1.5f)
+
+/* ================= 速度环算法选择 =================
+ *
+ *   0 = PID   (pid.c, 即上面 APP_FOC_SPEED_KP/KI 那一套, 行为与加 ADRC 之前完全一致)
+ *   1 = ADRC  (LADRC.c, 一阶线性自抗扰) —— 默认
+ *
+ *   【为什么默认用 ADRC】速度环的"对象参数"是三个都不准的量:
+ *       转矩常数 Kt、转动惯量 J、负载/摩擦。PID 只能靠 Ki 慢慢积出稳态电流,
+ *       而 Ki 一大就低频猎振(见上面那段历史); ADRC 的 ESO 把 Kt/J 误差、负载
+ *       转矩、摩擦、反电动势全部当成一个集总扰动 z2 实时观测并反相抵消,
+ *       b0 只需要"量级对", 不要求精确。
+ *
+ *   【切换方式】把 APP_SPEED_LOOP_ALG 改成 PID 即可原样回退; 两条路的输出限幅、
+ *   复位时机、方向系数完全共用, 所以可以直接对比同一组工况。
+ */
+#define APP_SPEED_LOOP_ALG_PID      (0)
+#define APP_SPEED_LOOP_ALG_ADRC     (1)
+
+#define APP_SPEED_LOOP_ALG          (APP_SPEED_LOOP_ALG_ADRC)
+
+#if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC)
+/* ================= 速度环: 一阶 LADRC 参数 =================
+ *
+ * 【被控对象】y = 机械转速 [RPM], u = iq 给定 [A]
+ *       dy/dt = b0·u + f
+ *   b0 是"1A 能让转速每秒变化多少 RPM", 由电机常数直接算:
+ *
+ *       Kv  = 54 RPM/V                       (用户给定)
+ *       Kt  = 9.5493 / Kv = 0.17684 N·m/A     (SI 下 Kt ≡ Ke, 9.5493 = 60/2π)
+ *       J   = 3.0e-5 kg·m²                   (4015 中空云台电机的典型值;
+ *                                             转动惯量未知, 按同规格电机取)
+ *       b0  = Kt/J · (60/2π)
+ *           = 0.17684 / 3.0e-5 × 9.5493
+ *           ≈ 56290 RPM/(s·A)
+ *
+ *   【为什么 J 取 3e-5】4015 转子直径 40mm、转子+磁钢约 40~60g, 且中空轴把
+ *   质量集中在半径附近: J ≈ 0.5·m·r² = 0.5×0.05×0.02² ≈ 1e-5, 加上磁轭/风叶
+ *   取 3e-5 是偏保守(偏大)的估计。J 每差一倍, b0 就差一倍 —— 但见下面
+ *   "b0 取偏了会怎样", 这不会让环路失稳, 只影响起步那几十毫秒的力度。
+ *
+ *   【b0 取偏了会怎样】LADRC 的控制量是 u = (wc·e - z2)/b0。b0 比真实值大,
+ *   前馈(第一拍)会偏小, 但 ESO 看到实测转速没跟上, z2 会立刻补一个等效扰动,
+ *   环路带宽仍然是 wc。所以 b0 的作用是"起手力度", 不是稳定性。
+ *
+ *   【b0 实测方法 (有空时做一次, 比猜 J 准)】
+ *       APP_IQ_STEP_TEST_ENABLE = 1 (app.h 下面), 方波幅值 0.3A;
+ *       看日志/CSV 里 iq 跳变后 rpm 的斜率 [RPM/s];
+ *       b0_meas = 斜率 / 0.3;
+ *       APP_SPEED_ADRC_B0_SCALE = b0_meas / 56290。
+ *   工程里 2026-10 的旧注释按 Kt≈0.03 估过"1A → 9.5RPM/ms"(b0≈9500), 那是
+ *   Kv≈318 的电机; 与本次给定的 KV54 差约 6 倍。如果实测斜率确实接近 9500,
+ *   把 B0_SCALE 设成 0.17 即可(不要改 KV —— 它是电机的铭牌参数)。
+ *
+ *   【两个带宽怎么取】
+ *     wc (控制器带宽) = 6Hz:
+ *        速度反馈是 alpha=0.1 @1kHz 的一阶低通, 截止约 16Hz。速度环带宽必须
+ *        明显低于它, 否则就是在控制一个自己看不快的量 -> 自激(旧 PID 注释里
+ *        Kp=0.02 那次 ±145RPM 震荡就是这个原因)。6Hz 与原来调好的 PID 带宽
+ *        (≈9549×0.004/2π ≈ 6Hz) 一致, 换算法不改手感。
+ *        想更快: 8~10Hz, 但要同时把编码器速度低通改小(见 app_encoder_init)。
+ *     wo (观测器带宽) = 4×wc = 24Hz:
+ *        常规取 3~5×wc。上限受采样率(1kHz)和速度低通(16Hz)限制; 再往上
+ *        z2 会把编码器量化噪声当扰动放大, 表现为 iq 高频抖动。
+ *        现象与调法:
+ *          z1 明显跟不上 rpm (日志里 z1 与 rpm 差几十 RPM) -> 提高 WO
+ *          iq/声音高频发毛、z2 大幅正负跳                       -> 降低 WO
+ */
+#define APP_SPEED_ADRC_KV_RPM_PER_V     (54.0f)
+#define APP_SPEED_ADRC_J_KG_M2          (3.0e-5f)
+
+/* Kt = 9.5493/Kv [N·m/A]; 1 rad/s = 9.5493 RPM */
+#define APP_SPEED_ADRC_KT_NM_PER_A      (9.5493f / APP_SPEED_ADRC_KV_RPM_PER_V)
+#define APP_SPEED_ADRC_B0_NOMINAL       (9.5493f * APP_SPEED_ADRC_KT_NM_PER_A \
+                                         / APP_SPEED_ADRC_J_KG_M2)
+/* 实测标定系数: 1.0 = 信上面的 KV/J 推算; 实测 b0 不同就按比例改这一个数 */
+#define APP_SPEED_ADRC_B0_SCALE         (1.0f)
+#define APP_SPEED_ADRC_B0               (APP_SPEED_ADRC_B0_NOMINAL \
+                                         * APP_SPEED_ADRC_B0_SCALE)
+
+/* 控制器带宽 wc 与观测器带宽 wo (Hz -> rad/s 在 app.c 里换算) */
+#define APP_SPEED_ADRC_WC_HZ            (6.0f)
+#define APP_SPEED_ADRC_WO_RATIO         (4.0f)     /* wo = 4·wc */
+#define APP_SPEED_ADRC_WC_RAD_S         (6.2831853f * APP_SPEED_ADRC_WC_HZ)
+#define APP_SPEED_ADRC_WO_RAD_S         (APP_SPEED_ADRC_WC_RAD_S \
+                                         * APP_SPEED_ADRC_WO_RATIO)
+
+/* 输出限幅直接复用 iq 限幅: ADRC 的输出就是 iq 给定, 必须 <= 过流门限,
+ * 否则速度环会自己把电流顶到过流保护上去。积分饱和问题在 ADRC 里不存在,
+ * 但 ESO 的模型项用的是【限幅后】的 u(见 LADRC.c), 所以饱和时观测器不会被骗。 */
+#define APP_SPEED_ADRC_U_MAX_A          (APP_FOC_SPEED_IQ_LIMIT_A)
+
+#endif /* APP_SPEED_LOOP_ALG == ADRC */
 
 /* ---- 速度环反馈方向 ----
  *

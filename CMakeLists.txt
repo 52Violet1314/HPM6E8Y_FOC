@@ -79,6 +79,8 @@ sdk_app_src(src/bsp/bsp_mt6701.c)
 sdk_app_src(src/bsp/bsp_spi_bb.c)
 # J11 排针按键 (位置点动; 低有效 + 内部上拉 + 消抖/长按连发)
 sdk_app_src(src/bsp/bsp_button.c)
+# 内置 EtherCAT(ESC) 硬件层: 时钟/引脚/PHY 复位/LINK 回灌 + 状态读取 (无协议栈)
+sdk_app_src(src/bsp/bsp_ecat.c)
 
 # ---- LCD/LVGL: 已整体搬到 core1 (见 core1/CMakeLists.txt) ----
 # 这里【故意】不再编译 src/lcd/*: 双核之后显示层归 core1, 同一份源码在哪个核上
@@ -96,6 +98,9 @@ sdk_app_src(src/FOC/foc.c)
 sdk_app_src(src/FOC/foc_math.c)
 # 通用 PID (电流环/速度环/位置环共用, 语义同 F405_M3508_FOC 的 PID.c)
 sdk_app_src(src/FOC/pid.c)
+# 一阶线性自抗扰 (LADRC): 速度环默认用它, PID 保留作对比/回退 (见 app.h 的
+# APP_SPEED_LOOP_ALG)
+sdk_app_src(src/FOC/LADRC.c)
 sdk_app_src(src/FOC/foc_openloop.c)
 sdk_app_src(src/FOC/foc_controller.c)
 # FOC 使用 sinf/cosf/sqrtf/fmodf, 需要链接 libm
@@ -114,6 +119,8 @@ sdk_app_src(src/app/app_scope.c)
 # 离线标定的 3200 组"编码器 raw -> 电角度"查表 (tools/enc_lut_build.py 生成)
 sdk_app_src(src/app/app_enc_lut.c)
 sdk_app_src(src/app/app_nv.c)
+# 内置 EtherCAT(ESC) 开箱自检 + 回环(J1<->J2)链路测试
+sdk_app_src(src/app/app_ecat.c)
 
 # ---- RTOS: 任务划分 (控制 / 日志) ----
 sdk_inc(src/rtos)

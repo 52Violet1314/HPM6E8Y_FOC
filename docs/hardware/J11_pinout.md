@@ -1,7 +1,8 @@
 # J11 扩展排针引脚表（已核对）
 
-来源：`HPM6EMotorV20.pdf` PAGE 2，用 pymupdf 按坐标提取（脚号 x≈594/607，网络名 x≈545/643），
-不是靠纯文本顺序猜的。提取脚本：`build/sch/j11_table.py`。
+来源：`docs/hardware/HPM6EMotorV20.pdf` PAGE 2，用 pymupdf 按坐标提取（脚号 x≈594/607，网络名 x≈545/643），
+不是靠纯文本顺序猜的。提取脚本：[tools/schematic/j11_table.py](../../tools/schematic/j11_table.py)
+（`python tools/schematic/j11_table.py`，依赖 pymupdf；探针脚本 `j11_probe.py`）。
 
 | 脚 | 网络 | 脚 | 网络 |
 |----|------|----|------|

@@ -65,16 +65,16 @@
 
 | 层 | 路径 | 职责 |
 | --- | --- | --- |
-| 入口 | [src/main.c](src/main.c) | `board_init` → `app_init` → `core1_start` → 启动 RTOS |
-| 应用编排 | [src/app/](src/app/) | 诊断、分级日志、编码器封装、位置环、电流环录波、NV 存档、离线段表 |
-| 控制算法 | [src/FOC/](src/FOC/) | Clarke/Park、SVPWM、电流环 PI、速度/位置 PID、开环驱动、控制器状态机 |
-| 板级驱动 | [src/bsp/](src/bsp/) | PWM / ADC / SPI / MT6701 / SEI / USB-CDC / 按键 |
-| 协议层 | [src/Hardware/mt6701/](src/Hardware/mt6701/) | MT6701 帧解析与 CRC（纯协议，无硬件依赖） |
-| 双核 | [src/dualcore/](src/dualcore/) | 镜像头校验、CPU1 释放、共享内存遥测/命令/日志协议 |
-| 显示核 | [core1/](core1/) | 独立 main、FreeRTOS、共享内存客户端、日志环形缓冲、串口 14 转发 |
-| 显示层 | [src/lcd/](src/lcd/) | LCDHw / LCDTouch / LCDGui / lcd_ui（core1 编译） |
+| 入口 | [src/main.c](../../src/main.c) | `board_init` → `app_init` → `core1_start` → 启动 RTOS |
+| 应用编排 | [src/app/](../../src/app/) | 诊断、分级日志、编码器封装、位置环、电流环录波、NV 存档、离线段表 |
+| 控制算法 | [src/FOC/](../../src/FOC/) | Clarke/Park、SVPWM、电流环 PI、速度/位置 PID、开环驱动、控制器状态机 |
+| 板级驱动 | [src/bsp/](../../src/bsp/) | PWM / ADC / SPI / MT6701 / SEI / USB-CDC / 按键 |
+| 协议层 | [src/Hardware/mt6701/](../../src/Hardware/mt6701/) | MT6701 帧解析与 CRC（纯协议，无硬件依赖） |
+| 双核 | [src/dualcore/](../../src/dualcore/) | 镜像头校验、CPU1 释放、共享内存遥测/命令/日志协议 |
+| 显示核 | [core1/](../../core1/) | 独立 main、FreeRTOS、共享内存客户端、日志环形缓冲、串口 14 转发 |
+| 显示层 | [src/lcd/](../../src/lcd/) | LCDHw / LCDTouch / LCDGui / lcd_ui（core1 编译） |
 
-关键设计文档：[DUAL_CORE.md](DUAL_CORE.md)（双核架构与排障表）、[ETHERCAT.md](ETHERCAT.md)（内置 ESC 使用方法）、[LCD_DISPLAY_FIX_REPORT.md](LCD_DISPLAY_FIX_REPORT.md) 与 [LCD_RPM_TEARING_FIX.md](LCD_RPM_TEARING_FIX.md)（显示通路排查）、[J11_pinout.md](J11_pinout.md)（扩展排针引脚表）。
+关键设计文档：[DUAL_CORE.md](DUAL_CORE.md)（双核架构与排障表）、[ETHERCAT.md](ETHERCAT.md)（内置 ESC 使用方法）、[SPEED_LOOP_LADRC.md](SPEED_LOOP_LADRC.md)（速度环一阶 LADRC 手稿与实现对照）、[LCD_DISPLAY_FIX_REPORT.md](../reports/LCD_DISPLAY_FIX_REPORT.md) 与 [LCD_RPM_TEARING_FIX.md](../reports/LCD_RPM_TEARING_FIX.md)（显示通路排查）、[J11_pinout.md](../hardware/J11_pinout.md)（扩展排针引脚表）。
 
 ---
 

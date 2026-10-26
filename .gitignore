@@ -41,3 +41,15 @@ __pycache__/
 
 # 上面 tmp/ 里如果有确实想留的东西, 用 ! 单独放行, 例如:
 # !/tmp/某个要留的文件
+
+# ---- 根目录散落的一次性输出（烧写 / OpenOCD / ninja 日志）----
+# 和 tmp/ 同一性质: "当时那一次"的产物, 不进仓库。
+# 有结论请写进 docs/reports/ 或 docs/design/, 原始 log 留在本地即可。
+/flash_*.txt
+/flash_*.log
+/ocd_*.txt
+/ninja_*.log
+/*.log
+
+# ---- clangd / 语言服务器缓存 ----
+/.cache/

@@ -45,7 +45,7 @@
 
 ### 1.2 原理图: J10 是"两组独立走线", 不是"共总线 + 双片选"
 
-来源 `HPM6EMotorV20.pdf` 的网络表(已提取到 `build/schematic_text.txt`, J10 那一段):
+来源 `docs/hardware/HPM6EMotorV20.pdf` 的网络表(已提取到 `build/schematic_text.txt`, J10 那一段):
 
 ```
 J10.3  = CS     -> PC11(B11/C6 网络)     J10.10 = T_SCLK -> PC20(A11)

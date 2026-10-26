@@ -23,7 +23,7 @@
 - **两个核的日志从同一根串口出**：core0 的日志经共享内存反向环交给 core1 转发，
   core0 那边一根线都不用接；调试输出有编译期总开关，出厂固件零打印。
 - **片内 EtherCAT 从站（ESC）+ 2 路 100M PHY** 已完成引脚与时钟级可行性验证，
-  为后续接入总线型伺服预留通道（见 [ETHERCAT.md](ETHERCAT.md)）。
+  为后续接入总线型伺服预留通道（见 [docs/design/ETHERCAT.md](docs/design/ETHERCAT.md)）。
 
 ## 核心指标
 
@@ -40,7 +40,21 @@
 | 板卡 / SDK | `hpm6e00YZ` / `hpm_sdk_localized_for_hpm6e00YZ`（v1.12.1 本地化裁剪） |
 
 软件分层 `main → app → FOC → BSP → Hardware`，中断留在 BSP 层经注册回调上抛，
-外设与算法解耦。更详细的介绍见 [PROJECT_INTRO.md](PROJECT_INTRO.md)。
+外设与算法解耦。更详细的介绍见 [docs/design/PROJECT_INTRO.md](docs/design/PROJECT_INTRO.md)。
+
+---
+
+## 演示
+
+| 实拍（点图看视频） | 说明 |
+|---|---|
+| [![LCD 界面 + FOC 运行](docs/media/images/poster_lcd_ui_foc_running.jpg)](docs/media/videos/lcd_ui_foc_running.mp4) | **界面 + FOC 闭环运行**（20 s）：屏幕实时刷新，`FOC RUNNING` / `SPEED MODE: SLIDE \| RPM` / `POS ON: HOLD POSITION`；core0 与 core1 各跑各的，互不抢占。 |
+| [![整机运行 520 RPM](docs/media/images/poster_motor_running_520rpm.jpg)](docs/media/videos/motor_running_520rpm.mp4) | **整机运行 520 RPM**（4 s）：板载两颗 100M PHY（HR911105A，为 EtherCAT 预留）+ 4015 云台电机，屏幕大字实时显示转速。 |
+
+> GitHub 的 README 不支持内嵌播放 mp4，点图片进入 [`docs/media/videos/`](docs/media/videos/) 下载后本地播放。
+
+速度环一阶 LADRC 的手写推导原稿在
+[docs/design/SPEED_LOOP_LADRC.md](docs/design/SPEED_LOOP_LADRC.md)。
 
 ---
 
@@ -135,9 +149,21 @@ core1 ──心跳───────────────▶ core0
 | `APP_SPEED_RAMP_RPM_S` | 1500 | 速度指令斜坡。**跟踪慢先查这里**，不是先调 PI |
 | `APP_FOC_RPM_KNEE` | 0.8 | 软限速拐点：从 80% 的 `RPM_LIMIT` 起线性砍 iq |
 | `APP_FOC_RPM_LIMIT` | 1000 | 软转速上限 |
-| `APP_FOC_SPEED_KP` | 0.004 | 速度环 P（A / RPM 误差） |
-| `APP_FOC_SPEED_KI` | 0.06 | 速度环 I |
+| `APP_FOC_SPEED_KP` | 0.004 | 速度环 P（A / RPM 误差）—— **仅 PID 回退时使用** |
+| `APP_FOC_SPEED_KI` | 0.06 | 速度环 I —— **仅 PID 回退时使用** |
 | `APP_FOC_SPEED_IQ_LIMIT_A` | 1.5 | 速度环输出上限（过流门限约 2 A，只剩 0.5 A 余量） |
+| `APP_SPEED_LOOP_ALG` | ADRC | 速度环算法：一阶 ADRC（默认）/ PID（回退、对比） |
+| `APP_SPEED_ADRC_KV_RPM_PER_V` | 54 | 电机 KV（铭牌值），用于算 Kt = 9.5493/KV |
+| `APP_SPEED_ADRC_J_KG_M2` | 3.0e-5 | 转动惯量（4015 中空云台典型值；未知时按此估） |
+| `APP_SPEED_ADRC_B0_SCALE` | 1.0 | 实测 b0 / 推算 b0；默认信 KV/J 推算，实测不同只改这一个数 |
+| `APP_SPEED_ADRC_WC_HZ` | 6.0 | ADRC 控制器带宽（与旧 PID 的 ≈6 Hz 对齐） |
+| `APP_SPEED_ADRC_WO_RATIO` | 4.0 | 观测器带宽 = 4×wc（24 Hz） |
+
+速度环默认是**一阶线性自抗扰（LADRC）**：对象 `dy/dt = b0·u + f`，
+`b0 = Kt/J·(60/2π) ≈ 56290 RPM/(s·A)`，ESO 把负载、摩擦、反电动势和
+`Kt/J` 误差一起估成 `z2` 并实时补偿，所以转动惯量未知也不影响稳定，
+只影响起步力度。调参顺序：先 `WC_HZ`（跟踪快慢），再 `WO_RATIO`
+（观测器跟不上就加、iq 高频发毛就减），`B0_SCALE` 最后按实测斜率校。
 
 ### 两条经验
 
@@ -207,7 +233,8 @@ core0 那边一根线都不用接：core0 的日志经共享内存反向环交�
 src/
   app/        应用层: app.c(主循环/速度环) app_motion.c(位置环) app_log.c(日志)
               app_diag.c(诊断) app_scope.c(电流环录波) app_nv.c(参数存储)
-  FOC/        foc.c / pid.c / foc_math.c — 与硬件无关的算法
+  FOC/        foc.c / pid.c / LADRC.c / foc_math.c — 与硬件无关的算法
+              (LADRC.c: 一阶自抗扰, 速度环默认使用)
   bsp/        板级驱动: pwm / adc / usb / mt6701 / button / spi_bb
   lcd/        LVGL 界面、LCD 硬件层、等宽数字点阵字体
   dualcore/   共享内存协议(shm_core.h) + core1 启动/同步
@@ -218,21 +245,32 @@ core1/
   linker/     core1 独立的链接脚本
 tools/        构建辅助 Python 脚本（字体生成、语法检查、共享内存日志解码）
 hpm_sdk_localized_for_hpm6e00YZ/   本地化裁剪的 HPMicro SDK（随仓库一起提交）
+docs/
+  README.md   文档索引
+  design/     架构/算法文档（PROJECT_INTRO / DUAL_CORE / SPEED_LOOP_LADRC / ETHERCAT）
+  hardware/   原理图 PDF、J11 引脚表、编码器协议
+  reports/    LCD 通路排查记录
+  media/      images/ 截图与照片、videos/ 实拍演示
 ```
 
 ---
 
 ## 文档
 
+全部资料都在 [`docs/`](docs/README.md)（[文档索引](docs/README.md)）。常用入口：
+
 | 文件 | 内容 |
 |---|---|
-| [PROJECT_INTRO.md](PROJECT_INTRO.md) | 工程简介与核心指标（**先读这个**） |
-| [DUAL_CORE.md](DUAL_CORE.md) | 双核架构、共享内存协议、启动流程 |
-| [ETHERCAT.md](ETHERCAT.md) | 片内 EtherCAT 从站（ESC）的可行性验证与引脚/时钟 |
-| [LCD_DISPLAY_FIX_REPORT.md](LCD_DISPLAY_FIX_REPORT.md) | 显示问题排查记录（SPI/DMA/时序） |
-| [LCD_RPM_TEARING_FIX.md](LCD_RPM_TEARING_FIX.md) | 转速大字撕裂/乱码的定位过程 |
-| [LCD_SPI_DMA_NOTES.md](LCD_SPI_DMA_NOTES.md) | LCD SPI + HDMA 的实现笔记 |
-| [J11_pinout.md](J11_pinout.md) | J11 扩展排针引脚定义 |
+| [docs/design/PROJECT_INTRO.md](docs/design/PROJECT_INTRO.md) | 工程简介与核心指标（**先读这个**） |
+| [docs/design/DUAL_CORE.md](docs/design/DUAL_CORE.md) | 双核架构、共享内存协议、启动流程 |
+| [docs/design/SPEED_LOOP_LADRC.md](docs/design/SPEED_LOOP_LADRC.md) | 速度环一阶 LADRC：手稿推导 ↔ `LADRC.c` 逐行对照 |
+| [docs/design/ETHERCAT.md](docs/design/ETHERCAT.md) | 片内 EtherCAT 从站（ESC）的可行性验证与引脚/时钟 |
+| [docs/hardware/J11_pinout.md](docs/hardware/J11_pinout.md) | J11 扩展排针引脚定义 |
+| [docs/hardware/HPM6EMotorV20.pdf](docs/hardware/HPM6EMotorV20.pdf) | 板卡原理图（V2.0） |
+| [docs/hardware/encoder_SRMA35/](docs/hardware/encoder_SRMA35/README.md) | 锐鹰 SRMA35/46 RS485 多圈绝对值编码器协议 |
+| [docs/reports/LCD_DISPLAY_FIX_REPORT.md](docs/reports/LCD_DISPLAY_FIX_REPORT.md) | 显示问题排查记录（SPI/DMA/时序） |
+| [docs/reports/LCD_RPM_TEARING_FIX.md](docs/reports/LCD_RPM_TEARING_FIX.md) | 转速大字撕裂/乱码的定位过程 |
+| [docs/reports/LCD_SPI_DMA_NOTES.md](docs/reports/LCD_SPI_DMA_NOTES.md) | LCD SPI + HDMA 的实现笔记 |
 
 ---
 

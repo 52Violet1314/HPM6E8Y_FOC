@@ -228,7 +228,7 @@ void LCD_GetTxStats(lcd_tx_stats_t *out)
  *
  * 【注意】本改动并不能替代"实验 1"的结论: 如果实测 spi_transfer 的 busy/timeout
  *   计数恒为 0(即一个字节都没丢), 那"长条"的根因就在 LVGL/窗口命令那一侧,
- *   这个 DMA 分支就不是解药, 不要合。判定见 LCD_DISPLAY_FIX_REPORT.md 第 3 节。
+ *   这个 DMA 分支就不是解药, 不要合。判定见 docs/reports/LCD_DISPLAY_FIX_REPORT.md 第 3 节。
  *
  * 【顺序严格照 hpm_spi_drv.h 的要求】先关 SPI 的 TX DMA 请求 -> 配 SPI 本次传输
  *   -> 配好并启动 DMA 通道 -> 再打开请求(数据此时才开始流动) -> 等 TC -> 等 SPI 空闲。

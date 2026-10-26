@@ -31,6 +31,7 @@
 #include "app_enc_lut.h"    /* 离线标定的 3200 组 raw -> 电角度表 */
 #include "app_motion.h"     /* 位置环 (外环, 输出速度给定) */
 #include "app_nv.h"
+#include "app_ecat.h"       /* 内置 EtherCAT(ESC) 开箱自检 + 回环链路测试 */
 #include "shm_core.h"       /* log_backend_shm: 反向日志环(core0 -> core1 的 UART14) */
 
 #include "bsp_pwm.h"
@@ -46,6 +47,7 @@
 #endif
 
 #include "foc_controller.h"
+#include "LADRC.h"          /* 速度环: 一阶 ADRC (与 pid.c 二选一, 见 app.h) */
 
 /* ================= 应用实例 ================= */
 static foc_controller_t s_ctrl;
@@ -96,10 +98,62 @@ static void app_log_format_rec(const app_log_rec_t *rec, char *out, uint32_t out
 static float            s_speed_ui_last_seen;    /* 上一拍看到的目标值, 用来判"变了" */
 
 #if APP_FOC_SPEED_LOOP_ENABLE
-/* 速度环: 通用 PID (pid.c)。增益/限幅在 app_init 里用下面这组宏初始化一次,
- * 之后每拍只调 PID_Step(); 需要在线改参就 PID_SetGains()。 */
+/* 速度环: PID 或一阶 ADRC, 由 app.h 的 APP_SPEED_LOOP_ALG 选择。
+ *   - PID : 通用 pid.c, 与加 ADRC 之前的行为完全一致(回退用);
+ *   - ADRC: LADRC.c, 参数与推导见 app.h 的"速度环: 一阶 LADRC 参数"。
+ * 两条路的输入(给定/实测)与输出(iq)完全同量纲, 所以切换只改这一处。
+ *
+ * 【为什么把 init/reset 也包成函数】速度环的"清状态"分散在 4 个地方
+ * (方向标定收尾、过流锁死、iq 阶跃测试、使能开关), 之前每个地方都写
+ * PID_Reset(&s_pid_spd)。换成 ADRC 后如果漏改一处, 残留的 z1/z2 会在
+ * 重新使能时直接变成一记电流冲击 —— 所以统一走 app_speed_loop_reset()。 */
+#if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC)
+static LADRC_typedef s_ladrc_spd;
+
+static void app_speed_loop_init(float ts)
+{
+    LADRC_Init(&s_ladrc_spd,
+               APP_SPEED_ADRC_B0,
+               APP_SPEED_ADRC_WC_RAD_S,
+               APP_SPEED_ADRC_WO_RAD_S,
+               ts,
+               APP_SPEED_ADRC_U_MAX_A);
+}
+
+static void app_speed_loop_reset(void)
+{
+    LADRC_Reset(&s_ladrc_spd);
+}
+
+/* 每拍把【实测控制周期】喂给观测器: 主循环被日志/显示任务挤长时, 写死 1ms
+ * 会让 wo 的实际值按比例缩水(观测器变慢)。只在合理范围内更新, 排除首拍和
+ * 调试器暂停造成的异常值。 */
+static void app_speed_loop_set_dt(float dt)
+{
+    if ((dt > 0.0002f) && (dt < 0.01f)) {
+        LADRC_SetTs(&s_ladrc_spd, dt);
+    }
+}
+#else
 static PID_Controller_t s_pid_spd;
+
+static void app_speed_loop_init(float ts)
+{
+    PID_InitSym(&s_pid_spd, APP_FOC_SPEED_KP, APP_FOC_SPEED_KI,
+                 ts, APP_FOC_SPEED_IQ_LIMIT_A, APP_FOC_SPEED_IQ_LIMIT_A);
+}
+
+static void app_speed_loop_reset(void)
+{
+    PID_Reset(&s_pid_spd);
+}
+
+static void app_speed_loop_set_dt(float dt)
+{
+    (void)dt;       /* 通用 PID 的 dt 在 init 里定死, 不支持逐拍变化 */
+}
 #endif
+#endif /* APP_FOC_SPEED_LOOP_ENABLE */
 
 /* 校准映射表转储节拍: 每 APP_CAL_MAP_DUMP_TICKS 次上报打印一次整张表。
  * 0 = 关闭。转储会连发 8 次 USB 写, 阻塞控制环、拖慢主循环 —— 这是开环
@@ -698,11 +752,11 @@ static void app_calib_speed_dir(float vbus_f)
         raw_delta += 16384;
     }
 
-    /* 收尾: 电流归零, 交回外环。积分必须清 —— 测试期间转子会转到几十 RPM,
-     * 速度环的积分会攒下饱和值。 */
+    /* 收尾: 电流归零, 交回外环。状态必须清 —— 测试期间转子会转到几十 RPM,
+     * 速度环会攒下"相当于饱和出力"的积分/扰动估计。 */
     foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, 0.0f);
     s_speed_target_rpm = 0.0f;
-    PID_Reset(&s_pid_spd);
+    app_speed_loop_reset();
 
     /* 幅值门限 200 counts ≈ 4.4°: 远大于编码器噪声, 又远小于本窗口的正常转角。
      * 动得太少(被齿槽/静摩擦顶住)时不要随手判方向, 保留静态值并告警。 */
@@ -873,21 +927,42 @@ void app_init(void)
     }
 #endif
 
+#if APP_ECAT_SELFTEST
+    /* 内置 EtherCAT(ESC) 开箱自检: 只点亮硬件 + 读链路状态, 不涉及协议栈。
+     * 回环测试(网线把 J1<->J2 对接)期间保留; 测完把 app_ecat.h 里的
+     * APP_ECAT_SELFTEST 改成 0, 这一整段就消失, 也不再有开机等待。 */
+    app_ecat_selftest();
+#endif
+
     /* 统一 FOC 控制器: 默认开环模式 */
     foc_controller_init(&s_ctrl, dt);
     foc_controller_set_voltage(&s_ctrl, APP_OPENLOOP_VOLTAGE_V);
     foc_controller_set_current_limit(&s_ctrl, APP_OPENLOOP_CURRENT_LIMIT);
 
 #if APP_FOC_SPEED_LOOP_ENABLE
-    /* 速度环 PID: 参数全部来自 app.h, 和电流环用同一个 PID_Step()。
-     *   - 输出限幅 = 积分限幅 = ±APP_FOC_SPEED_IQ_LIMIT_A (积分项就是稳态 iq);
+    /* 速度环初始化 (PID 或 ADRC, 由 app.h 的 APP_SPEED_LOOP_ALG 决定):
+     *   - 输出限幅 = ±APP_FOC_SPEED_IQ_LIMIT_A (ADRC 复用同一个 iq 上限);
      *   - dt = 控制周期 APP_MAIN_LOOP_MS (速度环在 1kHz 主循环里跑);
-     *   - ki 单位 A/(RPM·s), 内部乘 dt。
+     *   - ADRC 的 b0 推导 / KV54 / J / 带宽都写在 app.h 那一段里。
      * 【注意】这个 init 必须在 app_init 的早期(ADC 自检之前)完成: 那条 degraded
      * 路径会提前 return, 但速度环在 app_run 里照样每拍被调用。 */
-    PID_InitSym(&s_pid_spd, APP_FOC_SPEED_KP, APP_FOC_SPEED_KI,
-                 (float)APP_MAIN_LOOP_MS * 0.001f,
-                 APP_FOC_SPEED_IQ_LIMIT_A, APP_FOC_SPEED_IQ_LIMIT_A);
+    app_speed_loop_init((float)APP_MAIN_LOOP_MS * 0.001f);
+#if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC)
+    LOG_I("ADRC", "速度环 ADRC: KV=%d RPM/V, J=%d (1e-7 kg.m2), Kt=%d mN.m/A, "
+                  "b0=%d RPM/(s.A), wc=%d rad/s, wo=%d rad/s, iq_max=%d mA",
+          (int)APP_SPEED_ADRC_KV_RPM_PER_V,
+          (int)(APP_SPEED_ADRC_J_KG_M2 * 1.0e7f),
+          (int)(APP_SPEED_ADRC_KT_NM_PER_A * 1000.0f),
+          (int)APP_SPEED_ADRC_B0,
+          (int)APP_SPEED_ADRC_WC_RAD_S,
+          (int)APP_SPEED_ADRC_WO_RAD_S,
+          (int)(APP_SPEED_ADRC_U_MAX_A * 1000.0f));
+#else
+    LOG_I("APP", "速度环 PID: kp=%d uA/RPM, ki=%d uA/(RPM.s), iq_max=%d mA",
+          (int)(APP_FOC_SPEED_KP * 1.0e6f),
+          (int)(APP_FOC_SPEED_KI * 1.0e6f),
+          (int)(APP_FOC_SPEED_IQ_LIMIT_A * 1000.0f));
+#endif
 #endif
 
     /* 转速给定复位。
@@ -1771,7 +1846,7 @@ void app_motion_set_target_rad(float pos_rad)
  *   1) 延迟格式化: 控制任务只把【已经算好的整数】塞进 app_log_rec_t 入队(约 0.3us),
  *      snprintf 交给日志任务(见 app_log.c 的 app_log_task_body);
  *   2) 错峰: 窗口结算时先把几条记录【快照】下来, 之后每拍只投递一条 ——
- *      4 条摊到 4ms, 不再挤在同一拍, 串口那边也不会一次涌出 500 字符。
+ *      5 条摊到 5ms, 不再挤在同一拍, 串口那边也不会一次涌出 500 字符。
  *
  * 判读提示: "ctrl period: max=" 那一行如果原来明显大于 avg, 改完应该基本贴住 avg。
  */
@@ -1780,7 +1855,8 @@ enum {
     APP_LR_ADC_ISR,             /* a0..a2: rate, expect, dtmax_us */
     APP_LR_IQ_PP,               /* a0..a1: idpp_mA, iqpp_mA */
     APP_LR_FOC_LINE,            /* a0..a13: id,iq,idref,iqref,ud,uq,vbus,rpm,dir,pos,ref,err,spdref,raw */
-    APP_LR_ENC_HEALTH           /* a0..a13: reader(0=spi2,1=bitbang),bb,miso,fr,er,tfail,raw,last,step,steps,odo,stall,lutfull,lutreject */
+    APP_LR_ENC_HEALTH,          /* a0..a13: reader(0=spi2,1=bitbang),bb,miso,fr,er,tfail,raw,last,step,steps,odo,stall,lutfull,lutreject */
+    APP_LR_SPEED_ADRC           /* a0..a5: ref,rpm,z1,err,z2(RPM/s),iq_mA */
 };
 
 /* 格式化回调: 【跑在日志任务里】, 不在控制任务里 —— 这就是"延迟格式化"的全部意义 */
@@ -1824,6 +1900,26 @@ static void app_log_format_rec(const app_log_rec_t *r, char *out, uint32_t out_s
         break;
 #endif
 
+#if APP_FOC_SPEED_LOOP_ENABLE
+#  if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC) && APP_LOG_ADRC_STATUS
+    case APP_LR_SPEED_ADRC:
+        /* 速度环 ADRC 每秒一行。判读:
+         *   z1 与 rpm 差得多      -> 观测器跟不上, 提高 WO_HZ
+         *   z2 大幅正负跳         -> 观测器在追噪声, 降低 WO_HZ
+         *   err 长时间不收敛      -> WC_HZ 太小, 或 B0_SCALE 偏离实测
+         *   iq 顶在限幅           -> 正常(大阶跃起步), 但持续顶住就是 b0 太小/负载重 */
+        (void)snprintf(out, out_sz,
+                       "[INFO] [ADRC] 速度环: ref=%d rpm=%d z1=%d err=%d RPM | "
+                       "z2=%d RPM/s iq=%d mA (b0=%d RPM/(s.A), wc=%d, wo=%d rad/s)",
+                       (int)r->a[0], (int)r->a[1], (int)r->a[2], (int)r->a[3],
+                       (int)r->a[4], (int)r->a[5],
+                       (int)APP_SPEED_ADRC_B0,
+                       (int)APP_SPEED_ADRC_WC_RAD_S,
+                       (int)APP_SPEED_ADRC_WO_RAD_S);
+        break;
+#  endif
+#endif
+
 #if APP_LOG_ENC_HEALTH
     case APP_LR_ENC_HEALTH:
         /* 全场最长的一行(约 185 字符 / 14 个参数), 每 APP_ENC_HEALTH_MS(5s) 一次。
@@ -1846,7 +1942,7 @@ static void app_log_format_rec(const app_log_rec_t *r, char *out, uint32_t out_s
     }
 }
 
-#define APP_DEFER_MAX  (6U)    /* 1 秒窗口里有 4 条; 每 5 秒会和 ENC health 撞在一起 -> 5 条, 留 1 条余量 */
+#define APP_DEFER_MAX  (6U)    /* 1 秒窗口里有 5 条; 每 5 秒会和 ENC health 撞在一起 -> 6 条 */
 static app_log_rec_t s_defer[APP_DEFER_MAX];
 static uint8_t       s_defer_cnt;
 static uint8_t       s_defer_pos;
@@ -1887,7 +1983,7 @@ void app_run(void)
     int32_t iu_ma = 0, iv_ma = 0, iw_ma = 0;
 
     /* 【必须放在最前面】错峰投递那些"延迟格式化"的日志: 每拍只发一条。
-     * 放在这里而不是结算点, 是为了不让 4 条挤在同一拍。 */
+     * 放在这里而不是结算点, 是为了不让 5 条挤在同一拍。 */
     app_defer_drain();
     float ia, ib, ic, vbus;
     float du, dv, dw;
@@ -2780,38 +2876,50 @@ void app_run(void)
             }
 
             if (s_oc_tripped != 0U) {
-                /* 锁死后速度环积分必须清零: 否则复位重跑时它会带着旧积分冲出去 */
+                /* 锁死后速度环状态必须清零: 否则解锁/复位重跑时, 它会带着旧的
+                 * 积分(PID)或旧的扰动估计 z2(ADRC)直接冲出去。 */
 #if APP_FOC_SPEED_LOOP_ENABLE
-                PID_Reset(&s_pid_spd);
+                app_speed_loop_reset();
 #endif
                 iq = 0.0f;
             } else {
 #if APP_FOC_SPEED_LOOP_ENABLE
-                /* ---- a) 速度环 (目标 - 实测 -> iq) ----
-                 * 【为什么目标要乘 s_speed_dir】速度环必须是负反馈: 给定"正转速"
-                 * 时实测转速也必须朝正走。而"实测 rpm 的符号"取决于编码器计数
-                 * 方向、相电流极性(自检结果为 ±1)、FOC 电角度约定这三件事的组合,
-                 * 任何一处反了, 速度环就成了【正反馈】(iq 顶到限幅、转子被反拖)。
-                 * s_speed_dir 就是这三件事合成后的符号, 由开机自检实测出来
-                 * (见 app_init 的"速度环方向自检"); 不想自检就用它的静态默认值。
-                 * 用 s_speed_dir 而不是改 Kp/Ki 的符号, 是因为 Kp/Ki 同时决定
-                 * 环路增益的"量", 取负会让人误以为增益也变了。
+                /* ---- a) 速度环 (给定 - 实测 -> iq) ----
+                 * 算法由 app.h 的 APP_SPEED_LOOP_ALG 选择:
+                 *    ADRC: LADRC_Run() —— 输出 = (wc·e - z2)/b0, z2 是 ESO 观测到的
+                 *          集总扰动(负载/摩擦/反电动势/Kt、J 误差), 参数见 app.h;
+                 *    PID : PID_Step()  —— 与加 ADRC 之前完全一致, 用于回退/对比。
                  *
-                 * 【积分限幅 = 抗饱和】积分项本身就等于稳态所需的 iq, 所以把它
-                 * 夹在 ±IQ_LIMIT 内就够了。不夹的话, 目标远大于实际 (例如堵转)
-                 * 时积分会一路涨到天上, 松开负载后要好几秒才退出来。 */
+                 * 【给定和实测都要乘 s_speed_dir】
+                 * 速度环必须是负反馈: 给定"正转速"时实测转速也必须朝正走。而
+                 * "实测 rpm 的符号"取决于编码器计数方向、相电流极性(自检 ±1)、
+                 * FOC 电角度约定这三件事的组合, 任何一处反了, 环路就成了正反馈
+                 * (现象: iq 顶到限幅、转子被反拖)。s_speed_dir 就是三者合成后的
+                 * 符号, 由开机自检实测出来(见 app_init 的"速度环方向自检")。
+                 * 两边都乘 dir, 等于把被控对象折算到"正 iq 使 y 增大"的坐标系,
+                 * 这样 ADRC 的 b0 恒为正; 只给 target 乘(旧 PID 写法)在 dir=-1
+                 * 时会把误差算错 —— dir=+1 时两种写法完全等价。 */
                 {
-                    float target = s_speed_target_rpm * s_speed_dir;
-                    float e      = target - rpm;
+                    float ref = s_speed_target_rpm * s_speed_dir;
+                    float y   = rpm * s_speed_dir;
 
-                    /* 统一到 pid.c 的通用 PID —— 和电流环、位置环同一个实现
-                     * (语义同 F405_M3508_FOC 的 PID_Step):
-                     *   kp/ki/dt 来自 APP_FOC_SPEED_*, 输出限幅 ±IQ_LIMIT,
-                     *   积分限幅也 ±IQ_LIMIT(积分项本身就等于稳态所需 iq)。
-                     * 【和原来手写版的区别】原来是"先积分、再把输出限幅",
-                     * 饱和时积分照样涨(典型 windup); 现在是条件积分: 输出没饱和,
-                     * 或饱和了但误差在往回拉, 才积分。 */
-                    iq = PID_Step(&s_pid_spd, e);
+                    if (!s_ctrl.enabled) {
+                        /* 停机期间转子可能被外力带着转, 观测器会去追一个"不受控"
+                         * 的转速; 重新使能瞬间它会把这个当成扰动补一记电流冲击。
+                         * 所以没使能就清状态, 并让 iq 保持 0。 */
+                        app_speed_loop_reset();
+                        iq = 0.0f;
+                    } else {
+                        /* 观测器步长用【实测周期】: 主循环被日志/显示任务挤长时,
+                         * 写死 1ms 会让实际 wo 按比例缩水(观测器变慢)。PID 路径
+                         * 不支持逐拍 dt, 这个调用在那边是空操作。 */
+                        app_speed_loop_set_dt(s_dt_main);
+#if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC)
+                        iq = LADRC_Run(&s_ladrc_spd, ref, y);
+#else
+                        iq = PID_Step(&s_pid_spd, ref - y);
+#endif
+                    }
                 }
 #else
                 /* ---- b) 软限速, 代替原来的开关式 ----
@@ -2884,9 +2992,12 @@ void app_run(void)
                 }
                 iq = (step_hi != 0U) ? APP_IQ_STEP_AMP_A : -APP_IQ_STEP_AMP_A;
 
-                /* 位置环/速度环此刻算出来的东西全部作废, 顺便把速度环的积分
-                 * 清掉 —— 否则测试完一切回闭环, 那个被憋住的积分会突然出力。 */
-                PID_Reset(&s_pid_spd);
+                /* 位置环/速度环此刻算出来的东西全部作废, 顺便把速度环的状态
+                 * 清掉 —— 否则测试完一切回闭环, 旧积分/旧 z2 会突然出力。
+                 * (这个开关可以脱离速度环单独使用, 所以复位要跟着条件编译。) */
+#if APP_FOC_SPEED_LOOP_ENABLE
+                app_speed_loop_reset();
+#endif
             }
 #endif
 
@@ -3121,6 +3232,25 @@ void app_run(void)
 #endif
                 }
             }
+#if APP_FOC_SPEED_LOOP_ENABLE
+#  if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC) && APP_LOG_ADRC_STATUS
+            /* 速度环 ADRC 状态行 (1s): 判读见 app.h 的 APP_LOG_ADRC_STATUS。
+             * 和上面一样只算整数, 字符串留给日志任务拼。 */
+            {
+                int32_t a[6];
+                float ref = s_speed_target_rpm * s_speed_dir;
+                float rpm = app_encoder_get_mech_rpm(&s_encoder);
+
+                a[0] = (int32_t)ref;
+                a[1] = (int32_t)rpm;
+                a[2] = (int32_t)s_ladrc_spd.z1;
+                a[3] = (int32_t)(ref - rpm);
+                a[4] = (int32_t)s_ladrc_spd.z2;
+                a[5] = (int32_t)(s_ladrc_spd.u * 1000.0f);
+                app_defer_push(APP_LR_SPEED_ADRC, a, 6U);
+            }
+#  endif
+#endif
         }
     }
 #endif

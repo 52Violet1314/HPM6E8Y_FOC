@@ -42,7 +42,7 @@ printf("ESC type=%02X rev=%02X FMMU=%d SM=%d RAM=%dKB PORT_DESC=%02X PDI=%02X\n"
 
 ## 2. 这块板子上的 EtherCAT 是怎么接的
 
-从 `HPM6EMotorV20.pdf` 的 `ethercat.SchDoc`（两张 HR911105A 带变压器 RJ45）+ `boards/hpm6e00YZ/pinmux.c` 的 `init_esc_pins()` 对出来：
+从 `docs/hardware/HPM6EMotorV20.pdf` 的 `ethercat.SchDoc`（两张 HR911105A 带变压器 RJ45）+ `boards/hpm6e00YZ/pinmux.c` 的 `init_esc_pins()` 对出来：
 
 | 功能 | 引脚 | 备注 |
 |---|---|---|
@@ -242,10 +242,110 @@ void isr_esc(void)
 
 ---
 
-## 8. 相关文件速查
+## 7.5 回环测试（J1 ↔ J2 对插，不需要主站）
+
+已实现代码：`src/bsp/bsp_ecat.{c,h}`（硬件层）+ `src/app/app_ecat.{c,h}`（自检/日志），
+在 `app_init()` 里由 `APP_ECAT_SELFTEST` 开关控制。
+
+**接线**：一根网线把两个 EtherCAT 口对接（P0 ↔ P1，板上丝印 J1/J2）。上电即可。
+
+**能验证什么**：PHY 复位时序、25M 参考时钟、MDI+变压器+RJ45、LINK 经
+`ESC0_CTR_x` 的极性回灌。
+
+**不能验证什么**：报文通路。ESC 只转发/处理别人发来的帧，**它自己不会发帧**。
+
+> ⚠️ 实测结论（2026-10-25，J1↔J2 对插，两轮验证）：
+> 1. **MDIO（PDI 侧）读不到任何 PHY，扫 0~31 全灭；`PHY_STAT` 也恒为 0** —— 这是
+>    正常的：这颗芯片的片内 PHY **没有对外暴露寄存器通道**。链路判据只有一个：
+>    **`DL_STAT` 的 `PLP0/PLP1`**（LINK 是 PHY 的 LED 输出经 `ESC0_CTR_x` 回灌进
+>    ESC 的）。代价是读不到速率/双工寄存器值，但"有没有 link"是准的。
+> 2. `port_desc` 读出来是 **0x3F**（内核 4 个端口单元都描述成 MII），不是 0x0F；
+>    本板只引出 P0/P1，所以 `LP2/LP3` 恒为 1（无 link → 内部环回）。
+> 3. 回环线插上后 `DL_STAT` 从 `0x5506` → `0x5A36`：`PLP0=PLP1=1, LP0=LP1=0,
+>    CP0=CP1=1`（CP 也跟着置 1，这个 IP 的 CP 语义是"端口通信稳定"，不要求有报文）。
+
+预期日志（两个口都插好）：
+
+```
+[INFO] [ECAT] ---- 内置 EtherCAT(ESC) 自检 ----
+[INFO] [ECAT] ESC type=0xA2 rev=0x00 FMMU=8 SM=8 RAM=60KB port_desc=0x3F PDI=0x80 | DL_STAT=0x5A36
+[INFO] [ECAT] P0: PHY_STAT=0x00[...] (无 PHY 寄存器通道) ESC[plp=1 lp=0 cp=1] | MDIO 无应答(片内 PHY, 正常) | rxerr=0 lost=1 eeprom=0
+[INFO] [ECAT] P1: PHY_STAT=0x00[...] (无 PHY 寄存器通道) ESC[plp=1 lp=0 cp=1] | MDIO 无应答(片内 PHY, 正常) | rxerr=0 lost=1 eeprom=0
+[INFO] [ECAT] 结论: 两个口都 link —— 回环线接法正确
+```
+
+判读要点：
+
+| 现象 | 含义 |
+|---|---|
+| `PDI=0x80` | PDI 是 On-chip bus（内存映射），符合预期 |
+| `ESC[plp=1]` | **唯一可用且准确的链路判据**：PHY → LED → `ESC0_CTR_x` → ESC 这条链通了 |
+| `ESC[lp=0]` | 该口有 link，未内部环回（拔线后应变 1） |
+| `ESC[cp=1]` | 该 IP 里表示"端口通信稳定"，有 link 就会置起 |
+| `MDIO 无应答` / `PHY_STAT=0` | **正常**（片内 PHY 无寄存器通道） |
+| `eeprom=0` | 还没喂 SII（没跑协议栈），正常 |
+| `lost=1` | 上电复位期间掉过一次 link 的计数，正常 |
+
+**加一个反向验证**：拔掉网线 → `PLP` 变 0、`LP` 变 1、`lost_link` 计数 +1；
+再插回 → 变回 `PLP=1/LP=0`。这一对跳变能确认"链路检测"真的在工作，而不是读到一个
+恒定的电平。
+
+**下一步（真正验证报文通路，二选一）**：
+
+1. PC 网口 → J1（J2 空着或接下一台从站），发一个 EtherCAT 广播读帧（BRD 0x0000/0x0110）：
+   ESC 在 INIT 状态就会响应寄存器广播读，**不需要 SII、不需要协议栈**，收到回复即说明
+   PHY→MII→ESC→MII→PHY 整条链路通了。工具：SOEM、TwinCAT，或 scapy 裸帧。
+2. 用板上**普通以太网口**（RJ1，RTL8211E + TSW）当帧源，与 J1 对插，固件从 TSW 发裸
+   EtherCAT 帧、收回复 —— 全板自测，不用 PC；代价是要先把 TSW 驱动+裸帧收发写出来。
+
+---
+
+## 8. 落地路线（谁干什么、什么顺序）
+
+先澄清角色，别把顺序搞反：
+
+| 角色 | 是什么 | 谁提供 |
+|---|---|---|
+| **ESC** | 片内从站控制器（收发/FMMU/SM/DC） | 芯片自带 |
+| **从站协议栈** | 状态机、CoE、PDO、对象字典（跑在 CPU 上） | SSC / SOES / HPMicro 方案 |
+| **SII（.bin）** | EEPROM 内容：身份 + PDO/SM 配置 | SSC 生成 → 烧进 flash → EEPROM 模拟喂给 ESC |
+| **ESI（.xml）** | 给主站看的设备描述 | SSC 生成 → 导入 TwinCAT |
+| **TwinCAT** | **主站**，只是测试/验证工具 | Beckhoff（或 SOEM / IGH / HPM 板当主站） |
+
+**依赖链是倒过来的**：从站固件（栈 + SII）先跑起来，主站才扫得到。固件没跑起来之前，装好 TwinCAT 也只会看到 "no device"。
+
+正确顺序：
+
+1. **拿栈**：先问 HPMicro FAE 有没有现成的 SSC 移植（最省事）；否则 ETG 会员 + Beckhoff SSC Tool 自己生成；或 SOES（注意 GPLv2，商用要买授权）。
+2. **移 HAL**：SSC 里就是 `esc_hw.c` 那组函数（读/写 ESC 寄存器、EEPROM、定时器、中断）。HPM 是内存映射 PDI，`memcpy` 直读 `0xF1700000` 即可，比 SPI 型 ESC 简单。
+3. **生成三件套并保持一致**：栈代码 + `ESI.xml` + `SII.bin`；Vendor ID / Product Code / Revision 三处必须对得上。
+4. **烧 SII 到 flash**：`BOARD_ECAT_FLASH_EMULATE_EEPROM_ADDR = 0x200000`（正好在 core1 镜像 `0x80100000 + 1MB` 之后），用 4.2 的模拟服务喂给 ESC。
+5. **再上主站**：TwinCAT / SOEM 扫描 → PREOP → SAFEOP → OP。
+
+TwinCAT 侧的门槛（如果走它）：
+
+- TwinCAT 3 XAE，Windows 10/11 64 位 + VS Shell；运行时 7 天试用（可重置），调从站够用。
+- **网卡是硬门槛**：必须是 TwinCAT 支持列表里的 Intel 网卡（I210/I219 之类），并装 "TwinCAT Realtime Ethernet" 驱动；Realtek / USB 网卡基本扫不到总线。
+- ESI 放到 `C:\TwinCAT\3.1\Config\Io\EtherCAT\`，然后 VS 里 `EtherCAT → Scan Devices`。
+- 接线：PC 网口 → 板子 Port0（IN），Port1（OUT）空着或环回。
+
+更省事的替代：**SOEM**（`hpmicro/ethercat_soem`，PC 上装 Npcap 就能跑，不要专门网卡、不要 license），或者直接拿一块 HPM 板跑 `hpmicro/hpm_apps` 的 `apps/ecat_master_motor_control`（SOEM + CiA402，正好对口电机）。
+
+三个"卡脖子"前置条件：**Vendor ID**（正式产品要 ETG 分配，调试可先用临时 ID）、**SII 镜像**（板上没 EEPROM）、**ESI 与 SII 版本一致**（Revision 不匹配 TwinCAT 会报错）。
+
+里程碑建议：
+
+- **M1**（不需要主站）：PHY 复位释放 + MDIO 读 BMSR + 打印 ESC 能力寄存器/端口描述。
+- **M2**：EEPROM 模拟 + 最小 SII → 主站能读到身份。
+- **M3**：最小 PDO 跑通 OP，SYNC0 中断驱动电流环。
+- **M4**：CiA402 对象字典（0x6040/6041/6060/607A/6064…）。
+
+---
+
+## 9. 相关文件速查
 
 - 驱动：`hpm_sdk_localized_for_hpm6e00YZ/drivers/inc/hpm_esc_drv.h`、`drivers/src/hpm_esc_drv.c`
 - 寄存器：`hpm_sdk_localized_for_hpm6e00YZ/soc/HPM6E00/ip/hpm_esc_regs.h`
 - 板级：`hpm_sdk_localized_for_hpm6e00YZ/boards/hpm6e00YZ/{board.c,board.h,pinmux.c}`
 - 基地址/中断：`soc/HPM6E00/HPM6E80/hpm_soc_ip.h`、`hpm_soc_irq.h`
-- 原理图：`HPM6EMotorV20.pdf` 里的 `ethercat` 页（两张 HR911105A + 变压器）
+- 原理图：`docs/hardware/HPM6EMotorV20.pdf` 里的 `ethercat` 页（两张 HR911105A + 变压器）
