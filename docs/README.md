@@ -30,8 +30,10 @@ docs/
 |---|---|
 | [media/videos/lcd_ui_foc_running.mp4](media/videos/lcd_ui_foc_running.mp4) | 实拍：LVGL 界面实时刷新 + FOC 闭环运行（20 s，竖屏） |
 | [media/videos/motor_running_520rpm.mp4](media/videos/motor_running_520rpm.mp4) | 实拍：整机运行 520 RPM，板载双 PHY + 4015 云台电机（4 s，横屏） |
+| [media/videos/lcd_speed_mode_demo.mp4](media/videos/lcd_speed_mode_demo.mp4) | 实拍：界面速度页（`SPEED` + 位置模式），LCD 实时显示转速与位置 |
 | [media/images/poster_lcd_ui_foc_running.jpg](media/images/poster_lcd_ui_foc_running.jpg) | 第一条视频的封面帧（README 里当缩略图用） |
 | [media/images/poster_motor_running_520rpm.jpg](media/images/poster_motor_running_520rpm.jpg) | 第二条视频的封面帧 |
+| [media/images/poster_lcd_speed_mode_demo.jpg](media/images/poster_lcd_speed_mode_demo.jpg) | 第三条视频的封面帧 |
 | [media/images/speed_loop_ladrc_notes.jpg](media/images/speed_loop_ladrc_notes.jpg) | 速度环一阶 LADRC 的手写推导原稿（转录见 [design/SPEED_LOOP_LADRC.md](design/SPEED_LOOP_LADRC.md)） |
 
 ## 放文件的约定

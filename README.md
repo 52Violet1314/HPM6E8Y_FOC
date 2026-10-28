@@ -50,6 +50,7 @@
 |---|---|
 | [![LCD 界面 + FOC 运行](docs/media/images/poster_lcd_ui_foc_running.jpg)](docs/media/videos/lcd_ui_foc_running.mp4) | **界面 + FOC 闭环运行**（20 s）：屏幕实时刷新，`FOC RUNNING` / `SPEED MODE: SLIDE \| RPM` / `POS ON: HOLD POSITION`；core0 与 core1 各跑各的，互不抢占。 |
 | [![整机运行 520 RPM](docs/media/images/poster_motor_running_520rpm.jpg)](docs/media/videos/motor_running_520rpm.mp4) | **整机运行 520 RPM**（4 s）：板载两颗 100M PHY（HR911105A，为 EtherCAT 预留）+ 4015 云台电机，屏幕大字实时显示转速。 |
+| [![界面速度页 + 位置模式](docs/media/images/poster_lcd_speed_mode_demo.jpg)](docs/media/videos/lcd_speed_mode_demo.mp4) | **界面速度页 + 位置模式**（实拍）：LCD 实时显示 `SPEED` / 转速 / 位置，4015 云台电机 + 板载双 100M PHY。 |
 
 > GitHub 的 README 不支持内嵌播放 mp4，点图片进入 [`docs/media/videos/`](docs/media/videos/) 下载后本地播放。
 
