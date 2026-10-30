@@ -75,7 +75,9 @@ sdk_app_src(src/bsp/usb_cdc_acm.c)
 # 编码器 = MT6701, 经 SPI2 走 J11 扩展排针。
 sdk_app_src(src/bsp/bsp_spi.c)
 sdk_app_src(src/bsp/bsp_mt6701.c)
-# GPIO 软件模拟 SPI 作为接线排查/兜底后端
+# 锐鹰 SRMA35 17bit 绝对值编码器 (RS485): PD15=TX / PD14=RX / PD13=DE, UART11
+sdk_app_src(src/bsp/bsp_srma35.c)
+# GPIO 软件模拟 SPI (bit-bang) —— 编码器接线排查, 自动扫描 16 种 CPOL/CPHA/CS/位序
 sdk_app_src(src/bsp/bsp_spi_bb.c)
 # J11 排针按键 (位置点动; 低有效 + 内部上拉 + 消抖/长按连发)
 sdk_app_src(src/bsp/bsp_button.c)

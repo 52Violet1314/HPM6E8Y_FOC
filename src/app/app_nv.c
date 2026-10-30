@@ -66,13 +66,23 @@ static bool nv_header_ok(const uint8_t *b)
 {
     uint32_t magic;
     uint32_t ver;
+    uint32_t poles;
     uint32_t crc;
     uint32_t calc;
 
     (void)memcpy(&magic, b + 0U, 4U);
     (void)memcpy(&ver,   b + 4U, 4U);
+    (void)memcpy(&poles, b + 8U, 4U);
     (void)memcpy(&crc,   b + 24U, 4U);
     if ((magic != APP_NV_MAGIC) || (ver != APP_NV_VERSION)) {
+        return false;
+    }
+
+    /* 【必须校验极对数】同一条 Flash 上可能存着另一台电机 (例如 11 极对的
+     * 云台) 标出来的表。magic/CRC 都对, 但拿 11 极对的 LUT/offset 去换向
+     * 12 极对的伺服, 转子会被锁在错误角度上。极对数不匹配就当作没有存档,
+     * 强制重新扫描。 */
+    if (poles != (uint32_t)FOC_MOTOR_POLE_PAIRS) {
         return false;
     }
 

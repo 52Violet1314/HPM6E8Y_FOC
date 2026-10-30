@@ -39,6 +39,7 @@
 #include "bsp_usb.h"
 #include "bsp_button.h"     /* J11 按键 (位置点动) */
 #include "bsp_mt6701.h"
+#include "bsp_srma35.h"     /* 锐鹰 SRMA35: 17bit 单圈绝对值, RS485/UART11 */
 #if BSP_MT6701_USE_SEI
 #include "bsp_sei.h"
 #else
@@ -210,11 +211,11 @@ static uint32_t s_sweep_stall;      /* 连续"一步没动"的步数 -> 卡住�
 static uint32_t s_sweep_pairs;      /* 实测: 走满一整圈磁场转了几个电周期 = 极对数 */
 static uint32_t s_sweep_pre;        /* 预吸稳已经过的主循环数 */
 
-/* 把 14bit raw 差值折算到 (-8192, 8192] —— 抗 16384->0 回绕 */
+/* 把 raw 差值折算到 (-HALF, HALF] —— 抗 131072->0 回绕 (17bit 编码器) */
 static int32_t cal_wrap_raw(int32_t v)
 {
-    while (v > 8192)  { v -= 16384; }
-    while (v < -8192) { v += 16384; }
+    while (v > (int32_t)APP_ENC_RAW_HALF)  { v -= (int32_t)APP_ENC_RAW_MAX; }
+    while (v < -(int32_t)APP_ENC_RAW_HALF) { v += (int32_t)APP_ENC_RAW_MAX; }
     return v;
 }
 
@@ -735,7 +736,7 @@ static void app_calib_speed_dir(float vbus_f)
 
     /* 判据用"原始编码器角"而不是滤波后的 rpm: 后者是 alpha=0.1 的低通,
      * 短窗口里远没跟上真实速度, 取符号等于在噪声里猜。 */
-    raw_before = bsp_mt6701_get_raw_angle();
+    raw_before = (int32_t)app_encoder_get_raw_angle(&s_encoder);
 
     /* 旁路速度环: 直接给固定 iq (d 轴 0) */
     foc_controller_set_current_ref(&s_ctrl, 0.0f, APP_SPEED_DIR_TEST_IQ_A);
@@ -744,12 +745,12 @@ static void app_calib_speed_dir(float vbus_f)
         app_init_run_cycles(1U, vbus_f);
     }
 
-    raw_delta = (int32_t)bsp_mt6701_get_raw_angle() - (int32_t)raw_before;
-    /* 14bit 编码器, 按最短路径解卷绕(窗口内转角远小于半圈) */
-    if (raw_delta > 8192) {
-        raw_delta -= 16384;
-    } else if (raw_delta < -8192) {
-        raw_delta += 16384;
+    raw_delta = (int32_t)app_encoder_get_raw_angle(&s_encoder) - (int32_t)raw_before;
+    /* 17bit 编码器, 按最短路径解卷绕(窗口内转角远小于半圈) */
+    if (raw_delta > (int32_t)APP_ENC_RAW_HALF) {
+        raw_delta -= (int32_t)APP_ENC_RAW_MAX;
+    } else if (raw_delta < -(int32_t)APP_ENC_RAW_HALF) {
+        raw_delta += (int32_t)APP_ENC_RAW_MAX;
     }
 
     /* 收尾: 电流归零, 交回外环。状态必须清 —— 测试期间转子会转到几十 RPM,
@@ -758,18 +759,19 @@ static void app_calib_speed_dir(float vbus_f)
     s_speed_target_rpm = 0.0f;
     app_speed_loop_reset();
 
-    /* 幅值门限 200 counts ≈ 4.4°: 远大于编码器噪声, 又远小于本窗口的正常转角。
-     * 动得太少(被齿槽/静摩擦顶住)时不要随手判方向, 保留静态值并告警。 */
-    if ((raw_delta > 200) || (raw_delta < -200)) {
+    /* 幅值门限 1600 counts ≈ 4.4° (17bit: 131072/360*4.4): 远大于编码器噪声,
+     * 又远小于本窗口的正常转角。动得太少(被齿槽/静摩擦顶住)时不要随手判方向。 */
+    if ((raw_delta > 1600) || (raw_delta < -1600)) {
         s_speed_dir = (raw_delta < 0) ? -APP_SPEED_DIR_SIGN : APP_SPEED_DIR_SIGN;
         LOG_I("FOC", "方向标定: iq=+%d mA x %dms -> raw %u -> %u (d=%ld), s_speed_dir=%d",
               (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
-              (unsigned)raw_before, (unsigned)bsp_mt6701_get_raw_angle(),
+              (unsigned)raw_before,
+              (unsigned)app_encoder_get_raw_angle(&s_encoder),
               (long)raw_delta, (int)s_speed_dir);
     } else {
         s_speed_dir = APP_SPEED_DIR_SIGN;
         LOG_I("FOC", "!! 方向标定失败: iq=+%d mA x %dms 只让 raw 动了 %ld counts "
-                     "(需要 >200) -> 转子可能被顶住/带载。保留静态 dir=%d, "
+                     "(需要 >1600) -> 转子可能被顶住/带载。保留静态 dir=%d, "
                      "请空载重试或加大 APP_SPEED_DIR_TEST_IQ_A",
               (int)(APP_SPEED_DIR_TEST_IQ_A * 1000.0f), (int)APP_SPEED_DIR_TEST_MS,
               (long)raw_delta, (int)s_speed_dir);
@@ -857,6 +859,10 @@ void app_init(void)
     bsp_mt6701_register_frame_cb(app_on_mt6701_frame);
     bsp_mt6701_init();
     diag_set_stage(APP_STAGE_SEI_INIT);
+
+    /* 锐鹰 SRMA35: 17bit 单圈绝对值, RS485/UART11 (PD15=TX PD14=RX PD13=DE) */
+    bsp_srma35_init();
+
 #if BSP_MT6701_USE_SEI
     {
         bsp_sei_diag_t sd;
@@ -999,8 +1005,15 @@ void app_init(void)
     {
         static int16_t nv_tbl[ENC_LUT_BINS];
         int32_t        nv_off = 0;
+        bool           nv_ok  = false;
 
-        if (app_nv_load(nv_tbl, &nv_off)) {
+#if !APP_CAL_FORCE
+        nv_ok = app_nv_load(nv_tbl, &nv_off);
+#else
+        LOG_I("ENC", "NV: APP_CAL_FORCE=1 -> ignore saved table, recalibrate");
+#endif
+
+        if (nv_ok) {
             diag_lut_load(nv_tbl);
             app_encoder_set_elec_offset_rad((float)nv_off * 0.001f);
             s_lut_full   = 1U;
@@ -1039,7 +1052,7 @@ void app_init(void)
     foc_controller_set_voltage(&s_ctrl, APP_ENC_LUT_RUN_VOLTAGE_V);
     foc_controller_set_current_limit(&s_ctrl, APP_ENC_LUT_RUN_CURRENT_LIMIT_A);
     LOG_I("FOC", "BUILTIN LUT commutation: %u bins (%.2f counts/bin), V=%u mV, Ilim=%u mA, lead=%d deg",
-          (unsigned)APP_ENC_LUT_BINS, (float)16384.0f / (float)APP_ENC_LUT_BINS,
+          (unsigned)APP_ENC_LUT_BINS, (float)APP_ENC_RAW_MAX / (float)APP_ENC_LUT_BINS,
           (unsigned)(APP_ENC_LUT_RUN_VOLTAGE_V * 1000.0f),
           (unsigned)(APP_ENC_LUT_RUN_CURRENT_LIMIT_A * 1000.0f),
           (int)APP_ENC_LEAD_DEG);
@@ -2209,8 +2222,11 @@ void app_run(void)
     }
 
     /* ---- 采集: 编码器 / 电流 / 母线电压 ---- */
-    /* MT6701 走 SPI, 没有硬件周期触发, 由控制周期主动读一帧 (1kHz) */
-    diag_set_stage(APP_STAGE_LOOP_ENCODER);   /* 给中断诊断标记: bit-bang 读编码器 */
+    /* SRMA35 走 RS485(UART11), 由这里按 1kHz 主动发 CF 并收 11 字节 */
+    diag_set_stage(APP_STAGE_LOOP_ENCODER);   /* 给中断诊断标记: 读编码器 */
+    bsp_srma35_poll();
+    bsp_srma35_poll_log();
+    /* MT6701 已拆, 保留 poll 只为不改变 diag/LCD 的字段含义 (它会一直报错) */
     (void)bsp_mt6701_poll();
     /* 无论本帧成败都刷新诊断: 只靠成功回调的话, 编码器没接/没供电时
      * (poll 一直失败) CNT/ERR 会永远停在 0, 看不出任何信息。 */
@@ -3342,7 +3358,7 @@ void app_run(void)
             uint32_t raw_avg =
                 (uint32_t)(((int32_t)s_sweep_ref +
                             (s_sweep_a1 + s_sweep_a2) /
-                            (int32_t)(APP_CAL_SWEEP_HOLD - APP_CAL_SWEEP_DROP)) & 0x3FFF);
+                            (int32_t)(APP_CAL_SWEEP_HOLD - APP_CAL_SWEEP_DROP)) & (int32_t)APP_ENC_RAW_MASK);
 
             /* 【整圈里程计】净行程 = 各步平均位置的解卷绕累加。
              * 它是扫描的停止依据: 净行程到 16384 就说明编码器走过整整一圈,
@@ -3361,21 +3377,23 @@ void app_run(void)
                 if (dd > s_sweep_dmax) { s_sweep_dmax = dd; }
                 if (dd < s_sweep_dmin) { s_sweep_dmin = dd; }
                 /* 一步几乎没动 -> 转子被齿槽/失步顶住了。连着 APP_CAL_SWEEP_STALL_MAX
-                 * 步不动就提前收尾, 不能拿 1.5V 一直顶着烧。 */
-                if ((dd < 2) && (dd > -2)) { s_sweep_stall++; }
-                else                       { s_sweep_stall = 0U; }
+                 * 步不动就提前收尾, 不能拿 1.5V 一直顶着烧。
+                 * 【门槛随分辨率走】17bit 下静止噪声实测 ±2 counts, 14bit 时代的
+                 * "±2 就算没动"在这里等于把正常抖动当停滞, 所以放大到 ±16。 */
+                if ((dd < 16) && (dd > -16)) { s_sweep_stall++; }
+                else                         { s_sweep_stall = 0U; }
             }
             /* 每走完一个电周期, 打印这一周期转子实际推进了多少计数。
-             * 理想值恒为 16384/极对数 = 1365。
+             * 理想值恒为 131072/极对数 = 10922 (17bit)。
              * 若在整圈里忽大忽小(0.5x~2.4x) -> 编码器刻度不均匀(磁环偏心/倾斜);
-             * 换过磁环后应当落在 1365±130 之内。 */
+             * 换过磁环后应当落在 10922±1040 之内。 */
             if ((s_sweep_step % APP_CAL_SWEEP_PHASES) == 0U) {
                 if (s_sweep_step > 0U) {
                     (void)snprintf(line, sizeof(line),
                                    "CALCYC %2u ADV=%ld (ideal %ld)",
                                    (unsigned)(s_sweep_step / APP_CAL_SWEEP_PHASES),
                                    (long)cal_wrap_raw((int32_t)raw_avg - (int32_t)s_cyc_ref),
-                                   (long)(16384U / (uint32_t)FOC_MOTOR_POLE_PAIRS));
+                                   (long)(APP_ENC_RAW_MAX / (uint32_t)FOC_MOTOR_POLE_PAIRS));
                     app_log_write_raw(line);
                 }
                 s_cyc_ref = raw_avg;
@@ -3405,7 +3423,9 @@ void app_run(void)
                     raw_use = e1;
                     s_sweep_de_big++;
                 }
-                diag_lut_feed_static((uint32_t)(raw_use & 0x3FFF), sw_mrad);
+                /* 17bit raw -> >>3 折成 14bit 等价量, 喂给 1024 箱的诊断 LUT
+                 * (那张表是按 16384 一格建的, 整表只作诊断, 不参与换向) */
+                diag_lut_feed_static((uint32_t)(raw_use >> 3), sw_mrad);
 
                 if (s_sweep_de_n == 0U) {
                     s_sweep_de_min = d_e;
@@ -3422,7 +3442,7 @@ void app_run(void)
                                    (unsigned)s_sweep_step,
                                    (unsigned)sw_mrad,
                                    (unsigned)raw_avg,
-                                   (long)(e1 & 0x3FFF), (long)(e2 & 0x3FFF),
+                                   (long)(e1 & (int32_t)APP_ENC_RAW_MASK), (long)(e2 & (int32_t)APP_ENC_RAW_MASK),
                                    (long)d_e,
                                    (long)resid);
                     app_log_write_raw(line);
@@ -3446,7 +3466,7 @@ void app_run(void)
             s_sweep_step++;
             foc_controller_set_voltage(&s_ctrl, APP_CAL_SWEEP_HIGH_V);  /* 恢复标定电压(低压) */
 
-            if ((s_sweep_step >= s_sweep_steps) || (s_sweep_odo >= 16384) ||
+            if ((s_sweep_step >= s_sweep_steps) || (s_sweep_odo >= (int32_t)APP_ENC_RAW_MAX) ||
                 (s_sweep_stall >= APP_CAL_SWEEP_STALL_MAX)) {
                 /* ---- 自动给出结论 ----
                  * 残差均值 = 当前 offset 还差多少。推荐偏置 = 当前 + 残差均值。

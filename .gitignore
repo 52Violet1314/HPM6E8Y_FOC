@@ -1,5 +1,6 @@
 # ---- 构建产物（仅本工程，SDK 目录不作过滤，保证可克隆即编译）----
 /build/
+/build_servo/
 /cmake-build-*/
 /Debug/
 /Release/

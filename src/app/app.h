@@ -79,7 +79,7 @@ extern "C" {
  *           因为体检日志还要打印 sweep 进度)。
  *
  *   0 = 回到原来的路径: app_encoder 线性公式 (mech×极对数+偏置) + 运行时标定。 */
-#define APP_ENC_USE_BUILTIN_LUT     (1)
+#define APP_ENC_USE_BUILTIN_LUT     (0)     /* 换 SRMA35(17bit) 后旧表作废: 走 mech×极对数+offset */
 
 /* ================= 编码器角度查表 (1024 点 LUT) =================
  *
@@ -833,6 +833,13 @@ extern "C" {
  * (raw 840..1030) 正好是扫描起点、被上电拉入摆动污染的 —— 现在有 1.5s
  * 预吸稳 + 走满整圈才停 + 缺口>16箱就拒绝换向, 这三个修复还没跑过。
  * 0 = 回到开环边转边学 (备用)。 */
+/* 【强制重新标定】1 = 忽略 Flash 里的校准存档, 上电直接跑静态扫描。
+ * 换电机 / 换编码器 / 第一次标定时置 1; 标定完成、确认 NV 已保存后改回 0。
+ * 注意: 置 1 时每次上电都会扫 ~3 分钟, 正常使用必须为 0。 */
+#ifndef APP_CAL_FORCE
+#define APP_CAL_FORCE           (0)     /* 已按 5 对极标定并存进 Flash: 正常启动直接载入 */
+#endif
+
 #define APP_CAL_SWEEP_ENABLE    (1)
 /* 【整圈静态扫描】覆盖 APP_CAL_SWEEP_REVS 个机械整圈。
  *   总步数 = PHASES × 极对数 × REVS = 200 × 12 × 1 = 2400 步
