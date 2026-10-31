@@ -596,6 +596,16 @@ static void app_current_rate_limit(float *ia, float *ib, float *ic)
 }
 #endif
 
+/* SEI 新帧到达 (10kHz, 中断上下文)。
+ * 目前这一步只做"把新角度喂给编码器模块": 此前它在 1kHz 任务里被调用一次,
+ * 于是电角度要 1ms 才刷新一次、中断里只能靠 1ms 前的速度盲推 —— 10kHz 之后
+ * 每 100us 就有一个新角度, 重同步误差随之降到 1/10。 */
+static void app_on_srma35_frame(const bsp_srma35_frame_t *f)
+{
+    (void)f;
+    (void)app_encoder_update(&s_encoder);
+}
+
 /* ADC 采样完成中断 (20kHz, 由 PWM 触发):
  *   取相电流(按实测相序/极性) -> 物理限幅 -> 刷新诊断;
  *   若电流环跑在 ISR 里, 紧接着算 PI 并更新 PWM ——
@@ -622,7 +632,9 @@ static void app_on_adc_conv(void)
     diag_set_currents_ma(s_iu_ma, s_iv_ma, s_iw_ma);
 
 #if APP_CURRENT_LOOP_IN_ISR
-    if (s_isr_closed_loop != 0U) {
+    /* 【10kHz 电流环】PWM 载波仍是 20kHz(电流纹波小), 但控制每两个采样算一次:
+     * 采样->计算->更新占空比 仍在同一段里, 只是间隔从 50us 变成 100us。 */
+    if ((s_isr_closed_loop != 0U) && ((s_isr_cnt & 1U) == 0U)) {
         float    du, dv, dw;
         float    ang;
         uint64_t now = hpm_csr_get_core_mcycle();
@@ -861,6 +873,7 @@ void app_init(void)
     diag_set_stage(APP_STAGE_SEI_INIT);
 
     /* 锐鹰 SRMA35: 17bit 单圈绝对值, RS485/UART11 (PD15=TX PD14=RX PD13=DE) */
+    bsp_srma35_register_frame_cb(app_on_srma35_frame);
     bsp_srma35_init();
 
 #if BSP_MT6701_USE_SEI
@@ -2235,7 +2248,9 @@ void app_run(void)
                  bsp_mt6701_get_error_count(),
                  bsp_mt6701_get_last_raw(),
                  bsp_mt6701_get_transfer_fail());
-    (void)app_encoder_update(&s_encoder);
+    /* 【注意】app_encoder_update() 已经移到 SEI 帧回调里按 10kHz 调用,
+     * 这里【不能】再调 —— 否则会按 1ms 的 dt 再喂一次速度估算, 把 10kHz
+     * 的差分结果覆盖掉。 */
 
 #if APP_MOTION_ENABLE
     /* ---- 位置环 (外环): 位置误差 -> 速度给定 ----
