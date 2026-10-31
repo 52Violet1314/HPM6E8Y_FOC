@@ -69,7 +69,7 @@
  *   可摆 ±250°), DIFF 会扫遍全场, 任何一个采样值都不代表安装偏置。
  *
  * 【验证方法】改回标定模式重跑一次, CALSTEP 各行算出的 DIFF 应当接近 0。 */
-#define FOC_ELEC_ANGLE_OFFSET           (0.420f)
+#define FOC_ELEC_ANGLE_OFFSET           (5.425f)    /* 5 对极实测: 扫描 residual_mean=-1278mrad, 0.420-1.278+2pi = 5.425; NV 失效时的兜底值 */
 
 /* ---- 控制频率 ---- */
 #define FOC_PWM_FREQ_HZ                 (20000U)    /* 载波频率, 与 bsp_pwm 一致 */

@@ -608,6 +608,13 @@ static void app_cascade_10k(void)
 {
     float mech, rpm, ref, y, iq = 0.0f;
 
+    /* 【让位】标定扫描(app_run 里的 sweep)要自己设电压/角度, 它跑的时候外环必须
+     * 完全退出 —— 否则扫描在 1kHz 任务里推、外环每 100us 用 LADRC 覆盖 iq_ref,
+     * 两个控制器同时作用于一台电机, 表现就是"顶住-踢-再顶住"的抖。 */
+    if (s_sweep_done == 0U) {
+        return;
+    }
+
     mech = app_encoder_get_mech_rad(&s_encoder);
 
 #if APP_MOTION_ENABLE
