@@ -596,6 +596,54 @@ static void app_current_rate_limit(float *ia, float *ib, float *ic)
 }
 #endif
 
+/* 【10kHz 级联: 位置环 -> 速度环 -> iq 给定】
+ * 由 SEI 帧中断 (100us) 调用, 和编码器角度同步。放这里而不是 1kHz 任务里的原因:
+ *   - RTOS tick 是 1kHz, 任务给不到 100us; 而且外环一旦被日志/显示挤长, 输出
+ *     就晚一拍 —— 电机控制本来就该在中断里算;
+ *   - 计算量很小: LADRC 一次约 40 个浮点运算(软浮点也就 2~5us), 100us 周期够用;
+ *   - 过流锁死 / 未使能 时在这里清零, 不用等任务下一拍。 */
+#define APP_CASCADE_IN_ISR          (1)
+
+static void app_cascade_10k(void)
+{
+    float mech, rpm, ref, y, iq = 0.0f;
+
+    mech = app_encoder_get_mech_rad(&s_encoder);
+
+#if APP_MOTION_ENABLE
+    /* 位置环 (外环): 位置误差 -> 速度给定。未使能时不动 s_speed_target_rpm,
+     * 否则等于每拍把目标转速压成 0, 界面上的速度滑条就失效了。 */
+    {
+        float spd_ref = app_motion_run(&s_motion, mech);
+
+        if (s_motion.enable) {
+            s_speed_target_rpm = spd_ref;
+            s_motion_takeover  = 1U;
+        }
+    }
+#endif
+
+    rpm = app_encoder_get_mech_rpm(&s_encoder);
+
+    if ((s_ctrl.enabled == 0U) || (s_oc_tripped != 0U)) {
+        app_speed_loop_reset();
+        iq = 0.0f;
+    } else {
+        /* 给定与反馈都乘 s_speed_dir -> 折算到"正 iq 使 y 增大"的坐标系 */
+        ref = s_speed_target_rpm * s_speed_dir;
+        y   = rpm * s_speed_dir;
+
+#if (APP_SPEED_LOOP_ALG == APP_SPEED_LOOP_ALG_ADRC)
+        app_speed_loop_set_dt(1.0f / (1000000.0f / (float)BSP_SRMA35_PERIOD_US));
+        iq = LADRC_Run(&s_ladrc_spd, ref, y);
+#else
+        iq = PID_Step(&s_pid_spd, ref - y);
+#endif
+    }
+
+    foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, iq);
+}
+
 /* SEI 新帧到达 (10kHz, 中断上下文)。
  * 目前这一步只做"把新角度喂给编码器模块": 此前它在 1kHz 任务里被调用一次,
  * 于是电角度要 1ms 才刷新一次、中断里只能靠 1ms 前的速度盲推 —— 10kHz 之后
@@ -603,7 +651,8 @@ static void app_current_rate_limit(float *ia, float *ib, float *ic)
 static void app_on_srma35_frame(const bsp_srma35_frame_t *f)
 {
     (void)f;
-    (void)app_encoder_update(&s_encoder);
+    (void)app_encoder_update(&s_encoder);   /* 100us 一个新角度 + 速度估算 */
+    app_cascade_10k();                      /* 位置环 -> 速度环 -> iq 给定 */
 }
 
 /* ADC 采样完成中断 (20kHz, 由 PWM 触发):
@@ -2259,6 +2308,7 @@ void app_run(void)
      * 必须放在闭环段【之前】—— 那里每拍读 s_speed_target_rpm。
      * (闭环段读的是未斜坡的目标值, 所以位置环每拍的更新会被直接采用, 不会被
      *  APP_SPEED_RAMP_RPM_S 拖慢。) */
+#if !APP_CASCADE_IN_ISR
     {
         float spd_ref = app_motion_run(&s_motion, app_encoder_get_mech_rad(&s_encoder));
 
@@ -2305,6 +2355,7 @@ void app_run(void)
             s_motion_takeover = 1U;
         }
     }
+#endif /* !APP_CASCADE_IN_ISR */
 
     /* ---- 按键位置点动 (板上 Key2/Key3 + J11 外接回起点键) ----
      * 映射表见 src/bsp/bsp_button.c 的 s_cfg[]:
@@ -2906,6 +2957,11 @@ void app_run(void)
                       (int)(s_ctrl.foc.duty_w * 1000.0f));
             }
 
+#if APP_CASCADE_IN_ISR
+            /* 位置环/速度环/iq 给定 全部由 10kHz 的 SEI 中断算 (见 app_cascade_10k),
+             * 任务里不再重复计算 —— 否则两处都在写 s_ladrc_spd 的状态和 iq_ref,
+             * 一个按 100us 积分、一个按 1ms 积分, 观测器会被彻底搞乱。 */
+#else
             if (s_oc_tripped != 0U) {
                 /* 锁死后速度环状态必须清零: 否则解锁/复位重跑时, 它会带着旧的
                  * 积分(PID)或旧的扰动估计 z2(ADRC)直接冲出去。 */
@@ -3033,6 +3089,7 @@ void app_run(void)
 #endif
 
             foc_controller_set_current_ref(&s_ctrl, APP_FOC_ID_REF_A, iq);
+#endif /* APP_CASCADE_IN_ISR */
         }
 #endif
 
